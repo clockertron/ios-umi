@@ -20,6 +20,7 @@
 #import <objc/runtime.h>
 #import <dlfcn.h>
 #import <sys/sysctl.h>
+#import <sys/stat.h>
 #import <xpc/xpc.h>
 #import <objc/message.h>
 
@@ -589,6 +590,85 @@ plain_property(const char *key)
 	return NULL;
 }
 
+/*
+ * Mobile data (kernel 0277): the kernel's pdp_ip0 carries the modem's data session; kern.sweet_cell_data says
+ * "data=up if=pdp_ip0 addr=A gw=G mask=M dns=D1,D2 mtu=N ...". As CommCenter does, the cellular service goes into
+ * configd's dynamic store (State:/Network/Service/<id>/IPv4 and /DNS); IPMonitor then routes through it when no better
+ * service (Wi-Fi) is there. SCDynamicStore is "unavailable" in the iOS SDK: reached with dlsym.
+ */
+static NSString *
+data_state(void)
+{
+	char buf[256] = { 0 };
+	size_t n = sizeof(buf) - 1;
+	if (sysctlbyname("kern.sweet_cell_data", buf, &n, NULL, 0) != 0) {
+		return @"";
+	}
+	return [NSString stringWithUTF8String:buf];
+}
+
+static void
+data_publish(void)
+{
+	static void *store;
+	static CFTypeRef (*sc_create)(CFAllocatorRef, CFStringRef, void *, void *);
+	static Boolean (*sc_set_multiple)(CFTypeRef, CFDictionaryRef, CFArrayRef, CFArrayRef);
+	static NSString *published;
+	if (sc_create == NULL) {
+		dlopen("/System/Library/Frameworks/SystemConfiguration.framework/SystemConfiguration", RTLD_NOW);
+		sc_create = dlsym(RTLD_DEFAULT, "SCDynamicStoreCreate");
+		sc_set_multiple = dlsym(RTLD_DEFAULT, "SCDynamicStoreSetMultiple");
+		if (sc_create == NULL || sc_set_multiple == NULL) {
+			say(@"data: SCDynamicStore not found");
+			sc_create = (void *)1;
+			return;
+		}
+	}
+	if (sc_create == (void *)1) {
+		return;
+	}
+	if (store == NULL) {
+		store = (void *)sc_create(NULL, CFSTR("sweet-telephonyd"), NULL, NULL);
+		if (store == NULL) {
+			return;
+		}
+	}
+	NSMutableDictionary *kv = [NSMutableDictionary dictionary];
+	for (NSString *f in [data_state() componentsSeparatedByString:@" "]) {
+		NSArray *p = [f componentsSeparatedByString:@"="];
+		if (p.count == 2) {
+			kv[p[0]] = p[1];
+		}
+	}
+	BOOL up = [kv[@"data"] isEqualToString:@"up"] && [kv[@"if"] isEqualToString:@"pdp_ip0"] && kv[@"addr"] != nil;
+	NSString *now = up ? [NSString stringWithFormat:@"%@ %@ %@", kv[@"addr"], kv[@"gw"], kv[@"dns"]] : @"down";
+	if ([now isEqualToString:published ?: @""]) {
+		return;
+	}
+	NSString *svc = @"State:/Network/Service/5EE7CE11-0000-4000-8000-00000000AB55";
+	NSString *k4 = [svc stringByAppendingString:@"/IPv4"], *kd = [svc stringByAppendingString:@"/DNS"];
+	Boolean ok;
+	if (up) {
+		NSDictionary *v4 = @{ @"Addresses": @[ kv[@"addr"] ], @"DestAddresses": @[ kv[@"gw"] ],
+			              @"SubnetMasks": @[ @"255.255.255.255" ], @"Router": kv[@"gw"],
+			              @"InterfaceName": @"pdp_ip0" };
+		NSMutableArray *dns = [NSMutableArray array];
+		for (NSString *d in [kv[@"dns"] componentsSeparatedByString:@","]) {
+			if (d.length && ![d isEqualToString:@"0.0.0.0"]) {
+				[dns addObject:d];
+			}
+		}
+		NSDictionary *dn = @{ @"ServerAddresses": dns, @"InterfaceName": @"pdp_ip0" };
+		ok = sc_set_multiple((CFTypeRef)store, (__bridge CFDictionaryRef) @{ k4: v4, kd: dn }, NULL, NULL);
+	} else {
+		ok = sc_set_multiple((CFTypeRef)store, NULL, (__bridge CFArrayRef) @[ k4, kd ], NULL);
+	}
+	say(@"data: cellular service %@ in configd: %@ (%@)", up ? @"published" : @"removed", ok ? @"ok" : @"FAILED", now);
+	if (ok) {
+		published = now;
+	}
+}
+
 static void
 plain_listen(const char *service)
 {
@@ -704,7 +784,20 @@ main(void)
 			for (SweetCT *c in [registered_clients copy]) {
 				notify_client(c, NO);
 			}
+			data_publish();
 			log_flush();
+			/* a new binary installed: exit, launchd (KeepAlive) starts it (no reboot per update) */
+			static struct timespec mt;
+			struct stat st;
+			if (stat("/usr/local/bin/sweet-telephonyd", &st) == 0) {
+				if (mt.tv_sec == 0) {
+					mt = st.st_mtimespec;
+				} else if (st.st_mtimespec.tv_sec != mt.tv_sec || st.st_mtimespec.tv_nsec != mt.tv_nsec) {
+					say(@"new binary installed: exiting for launchd to start it");
+					log_flush();
+					exit(0);
+				}
+			}
 		});
 		dispatch_resume(tick);
 		dispatch_main();

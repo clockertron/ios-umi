@@ -2,6 +2,33 @@
 
 ## umi (Xiaomi Mi 10, SM8250) port - branch `umi` on qcom-toolbox/ios-sweet (2026-10-20)
 
+- **2026-11-11 20:25: 🎉 MOBILE DATA WORKS - Safari loads pages over LTE (Sunrise) with Wi-Fi off** (user: "Safari
+  works"). Patch `xnu/patches/0277-umi-x55-pdp-ip0.patch` (kernel 70b0c82); image **`shim/out/umi-0277b-pdp-ip0.img`**
+  (`sweetmdm=10 sweetmdmonline=1`, no ADT baseband node); sweet-telephonyd with the configd service (this commit).
+  - **Kernel: `pdp_ip0`**, the name / type of a real iPhone's cellular interface: IFNET_FAMILY_CELLULAR, IFT_CELLULAR,
+    raw IP (no link header, demux by the version nibble), IFF_POINTOPOINT to the session's gateway, the session's
+    address /32, MTU from the session (1410). Created once the IP_HW0 channels run and the session is up (the modem
+    thread); link on / off posted (KEV_DL_LINK_ON) with the address. Output: a 64-packet queue drained by the modem
+    thread (it alone touches the MHI rings); input: ifnet_input from the modem thread.
+  - **Trap: `proto_plumb(PF_INET)` fails with ENXIO (6) on the cellular family** (no plumber registered for it; the
+    kernel also logs "in_domifattach: proto_plumb returned 6"): the address was set but IPv4 had no protocol attached
+    (0277). Fixed as utun: `ifnet_attach_protocol` for PF_INET and PF_INET6 with an input that calls `proto_input`.
+  - `kern.sweet_cell_data` every 5 s: `data=up if=pdp_ip0 addr= gw= mask= dns=D1,D2 mtu= rx= tx= cmds= drops= answers=`
+    (0277 had the test counter also named `dns=`, which overwrote the servers in the daemon's parse).
+  - **iOS: sweet-telephonyd publishes the cellular service as CommCenter does**: configd dynamic store
+    `State:/Network/Service/5EE7CE11-0000-4000-8000-00000000AB55/IPv4` (Addresses, DestAddresses = gateway,
+    SubnetMasks 255.255.255.255, Router, InterfaceName pdp_ip0) and `/DNS` (ServerAddresses, InterfaceName); removed
+    when the session is down. IPMonitor then makes it the primary service when Wi-Fi is not joined. SCDynamicStore is
+    "unavailable" in the iOS SDK (dlsym); the binary is signed with
+    `com.apple.SystemConfiguration.SCDynamicStore-write-access` (`phone/sweet-telephonyd/entitlements.plist`).
+  - **Phone file changed (user-approved file, updated):** `/usr/local/bin/sweet-telephonyd` (read back). It now exits
+    when its binary changes (launchd restarts it): later updates need no reboot.
+  - USB networking dropped once early in a 0277 boot (the Mac lost 192.168.7.1, the log stopped; the modem had not
+    started yet) - "no signal" on that boot was the log, not the modem; the next boots were normal.
+  - Open: IPv6 on pdp_ip0 (a second WDS session, family 6); the status bar's data type (LTE / 4G from getDataStatus);
+    Settings > Cellular (the opt-in ADT baseband node, display issue); the Cellular Data switch; session loss / modem
+    restart with the interface (pd_configure(0) on restart, untested); throughput (one packet per MHI element, polled
+    every 2 ms).
 - **2026-11-11 19:45: MOBILE DATA STAGE B - PACKETS BOTH WAYS: a DNS query sent by the kernel over LTE got its answer**
   (patch `xnu/patches/0276-umi-x55-data-packets.patch`; image `shim/out/umi-0276b-data-packets.img`, `sweetmdm=10`).
   - MHI now has 9 event rings (MHICFG NER 9, NHWER 2; the command context moved 0x2100 -> 0x2400 to make room): 0

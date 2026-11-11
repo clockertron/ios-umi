@@ -11,7 +11,7 @@ xcrun --sdk iphoneos clang -arch arm64 -isysroot "$sdk" -miphoneos-version-min=1
     -O2 -Wall -Wextra -Werror -Wno-unused-parameter -fobjc-arc \
     -framework Foundation \
     -o phone/out/sweet-telephonyd phone/sweet-telephonyd/sweet_telephonyd.m
-/opt/local/bin/ldid -S phone/out/sweet-telephonyd
+/opt/local/bin/ldid -Sphone/sweet-telephonyd/entitlements.plist phone/out/sweet-telephonyd   # configd write access (mobile data service)
 echo "built phone/out/sweet-telephonyd"
 if [ "${1:-}" = install ]; then
 	tools/umi-files.py mkdir /usr/local/bin 755 || true

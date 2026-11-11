@@ -1,0 +1,395 @@
+From 70b0c82065774519aec1698e9f4e542f02e91c06 Mon Sep 17 00:00:00 2001
+From: qualcomm-toolbox <169756160+qcom-toolbox@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 20:24:34 +0100
+Subject: [PATCH] umi: X55 mobile data stage C: pdp_ip0 (cellular, raw IP,
+ point to point) carries IP_HW0; IPv4/IPv6 attached as utun (no cellular
+ plumber); status for sweet-telephonyd in kern.sweet_cell_data (0277)
+
+---
+ bsd/dev/sweet_mdm.c | 322 +++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 307 insertions(+), 15 deletions(-)
+
+diff --git a/bsd/dev/sweet_mdm.c b/bsd/dev/sweet_mdm.c
+index 50ef2fa..0e014f4 100644
+--- a/bsd/dev/sweet_mdm.c
++++ b/bsd/dev/sweet_mdm.c
+@@ -60,6 +60,18 @@
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include <sys/sysctl.h>
++#include <kern/locks.h>
++#include <sys/kpi_mbuf.h>
++#include <sys/kpi_socket.h>
++#include <sys/sockio.h>
++#include <net/if.h>
++#include <net/if_types.h>
++#include <net/if_media.h>
++#include <net/kpi_interface.h>
++#include <net/kpi_protocol.h>
++#include <net/dlil.h>
++#include <netinet/in.h>
++#include <sys/kern_event.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t thread_terminate(thread_t);
+@@ -2312,9 +2324,10 @@ static struct {
+ 	uint32_t handle;
+ 	uint32_t addr, gw, mask, dns1, dns2, mtu;
+ 	bool up;
++	char a[16], g[16], mk[16], d1[16], d2[16];
+ } mdd;
+ 
+-static char sweet_cell_data[160] = "data=off";
++static char sweet_cell_data[256] = "data=off";
+ SYSCTL_STRING(_kern, OID_AUTO, sweet_cell_data, CTLFLAG_RD | CTLFLAG_LOCKED, sweet_cell_data, sizeof(sweet_cell_data),
+     "sweet: the modem's mobile data session (sweetmdm=10)");
+ 
+@@ -2435,15 +2448,15 @@ mx_data_rx(uint32_t svc, unsigned msg, const uint8_t *m, uint32_t len, unsigned
+ 				    (uint32_t)v[0] | (uint32_t)v[1] << 8 | (uint32_t)v[2] << 16 | (uint32_t)v[3] << 24;
+ 			}
+ 		}
+-		char a[16], g[16], mk[16], d1[16], d2[16];
+-		mx_ip4(a, sizeof(a), mdd.addr);
+-		mx_ip4(g, sizeof(g), mdd.gw);
+-		mx_ip4(mk, sizeof(mk), mdd.mask);
+-		mx_ip4(d1, sizeof(d1), mdd.dns1);
+-		mx_ip4(d2, sizeof(d2), mdd.dns2);
+-		printf("SWEET MDM: DATA: UP: address %s gateway %s mask %s dns %s %s mtu %u\n", a, g, mk, d1, d2, mdd.mtu);
+-		snprintf(sweet_cell_data, sizeof(sweet_cell_data), "data=up addr=%s gw=%s mask=%s dns=%s,%s mtu=%u", a, g, mk,
+-		    d1, d2, mdd.mtu);
++		mx_ip4(mdd.a, sizeof(mdd.a), mdd.addr);
++		mx_ip4(mdd.g, sizeof(mdd.g), mdd.gw);
++		mx_ip4(mdd.mk, sizeof(mdd.mk), mdd.mask);
++		mx_ip4(mdd.d1, sizeof(mdd.d1), mdd.dns1);
++		mx_ip4(mdd.d2, sizeof(mdd.d2), mdd.dns2);
++		printf("SWEET MDM: DATA: UP: address %s gateway %s mask %s dns %s %s mtu %u\n", mdd.a, mdd.g, mdd.mk, mdd.d1,
++		    mdd.d2, mdd.mtu);
++		snprintf(sweet_cell_data, sizeof(sweet_cell_data), "data=up if=- addr=%s gw=%s mask=%s dns=%s,%s mtu=%u",
++		    mdd.a, mdd.g, mdd.mk, mdd.d1, mdd.d2, mdd.mtu);
+ 		mdd.up = true;
+ 	}
+ 	mdd.step++;
+@@ -2547,12 +2560,279 @@ mx_data_test(void)
+ 	    mx_data_send(p, n) ? "sent" : "NOT sent (ring full)");
+ }
+ 
++/*
++ * ---- mobile data, stage C: pdp_ip0, the network interface iOS sees (the name and type of a real iPhone's) ----
++ * Raw IP, point to point to the session's gateway, cellular family / type (functional type cellular). Created and
++ * given the session's address when the session is up and the channels run; the link is marked down when the session
++ * goes. Output from the stack is queued (64 packets) and sent by the modem thread, which alone touches the rings;
++ * received packets go to ifnet_input from the modem thread. Routes and DNS are configd's: sweet-telephonyd publishes
++ * the service from kern.sweet_cell_data.
++ */
++#define PD_Q    64u
++static struct {
++	ifnet_t ifp;
++	lck_mtx_t *lock;
++	mbuf_t q[PD_Q];
++	unsigned head, count;
++	uint32_t addr;                  /* the address it has (0: none) */
++	unsigned in, out, qdrops, big;
++} pd;
++
++static errno_t
++pd_demux(ifnet_t ifp __unused, mbuf_t m, char *fh __unused, protocol_family_t *proto)
++{
++	while (m != NULL && mbuf_len(m) < 1) {
++		m = mbuf_next(m);
++	}
++	if (m == NULL) {
++		return ENOENT;
++	}
++	unsigned v = *(const uint8_t *)mbuf_data(m) >> 4;
++	*proto = v == 4 ? PF_INET : v == 6 ? PF_INET6 : 0;
++	return *proto ? 0 : ENOENT;
++}
++
++static errno_t
++pd_add_proto(ifnet_t ifp __unused, protocol_family_t p __unused, const struct ifnet_demux_desc *d __unused,
++    u_int32_t n __unused)
++{
++	return 0;
++}
++
++static errno_t
++pd_del_proto(ifnet_t ifp __unused, protocol_family_t p __unused)
++{
++	return 0;
++}
++
++static errno_t
++pd_output(ifnet_t ifp, mbuf_t m)
++{
++	lck_mtx_lock(pd.lock);
++	if (pd.count == PD_Q || !mxd.started || pd.addr == 0) {
++		pd.qdrops++;
++		lck_mtx_unlock(pd.lock);
++		mbuf_freem(m);
++		ifnet_stat_increment_out(ifp, 0, 0, 1);
++		return 0;
++	}
++	pd.q[(pd.head + pd.count) % PD_Q] = m;
++	pd.count++;
++	lck_mtx_unlock(pd.lock);
++	return 0;
++}
++
++static errno_t
++pd_ioctl(ifnet_t ifp __unused, unsigned long cmd, void *data)
++{
++	switch (cmd) {
++	case SIOCGIFMEDIA32:
++	case SIOCGIFMEDIA64: {
++		struct ifmediareq *ifmr = (struct ifmediareq *)data;
++		ifmr->ifm_current = ifmr->ifm_active = IFM_ETHER | IFM_AUTO;
++		ifmr->ifm_mask = 0;
++		ifmr->ifm_status = IFM_AVALID | (pd.addr != 0 ? IFM_ACTIVE : 0);
++		ifmr->ifm_count = 0;
++		return 0;
++	}
++	case SIOCSIFADDR:
++	case SIOCAIFADDR:
++	case SIOCSIFFLAGS:
++	case SIOCADDMULTI:
++	case SIOCDELMULTI:
++		return 0;
++	default:
++		return EOPNOTSUPP;
++	}
++}
++
++static void
++pd_detach(ifnet_t ifp __unused)
++{
++}
++
++/* IPv4 / IPv6 attached as utun does: no plumber exists for the cellular family (proto_plumb: ENXIO, 0277) */
++static errno_t
++pd_proto_input(ifnet_t ifp, protocol_family_t protocol, mbuf_t m, char *header __unused)
++{
++	size_t n = mbuf_pkthdr_len(m);
++	if (proto_input(protocol, m) != 0) {
++		mbuf_freem(m);
++		ifnet_stat_increment_in(ifp, 0, 0, 1);
++	} else {
++		ifnet_stat_increment_in(ifp, 1, (u_int32_t)n, 0);
++	}
++	return 0;
++}
++
++static errno_t
++pd_proto_pre_output(ifnet_t ifp __unused, protocol_family_t protocol __unused, mbuf_t *m __unused,
++    const struct sockaddr *dest __unused, void *route __unused, char *frame_type __unused, char *lladdr __unused)
++{
++	return 0;
++}
++
++static errno_t
++pd_attach_proto(protocol_family_t protocol)
++{
++	struct ifnet_attach_proto_param proto;
++	bzero(&proto, sizeof(proto));
++	proto.input = pd_proto_input;
++	proto.pre_output = pd_proto_pre_output;
++	errno_t e = ifnet_attach_protocol(pd.ifp, protocol, &proto);
++	return e == EEXIST ? 0 : e;
++}
++
++static void
++pd_create(void)
++{
++	struct ifnet_init_eparams init;
++	static lck_grp_t *grp;
++	grp = lck_grp_alloc_init("sweet_pdp", LCK_GRP_ATTR_NULL);
++	pd.lock = lck_mtx_alloc_init(grp, LCK_ATTR_NULL);
++	bzero(&init, sizeof(init));
++	init.ver = IFNET_INIT_CURRENT_VERSION;
++	init.len = sizeof(init);
++	init.flags = IFNET_INIT_LEGACY;
++	init.uniqueid = "sweet-x55-ip-hw0";
++	init.uniqueid_len = sizeof("sweet-x55-ip-hw0") - 1;
++	init.name = "pdp_ip";
++	init.unit = 0;
++	init.family = IFNET_FAMILY_CELLULAR;
++	init.type = IFT_CELLULAR;
++	init.output = pd_output;
++	init.demux = pd_demux;
++	init.add_proto = pd_add_proto;
++	init.del_proto = pd_del_proto;
++	init.ioctl = pd_ioctl;
++	init.detach = pd_detach;
++	if (ifnet_allocate_extended(&init, &pd.ifp) != 0) {
++		printf("SWEET MDM: DATA: pdp_ip0: ifnet_allocate failed\n");
++		pd.ifp = NULL;
++		return;
++	}
++	ifnet_set_addrlen(pd.ifp, 0);
++	ifnet_set_hdrlen(pd.ifp, 0);
++	ifnet_set_mtu(pd.ifp, mdd.mtu >= 576 && mdd.mtu <= 1500 ? mdd.mtu : 1400);
++	ifnet_set_baudrate(pd.ifp, 100000000);
++	ifnet_set_flags(pd.ifp, IFF_POINTOPOINT | IFF_MULTICAST, 0xffff);
++	if (ifnet_attach(pd.ifp, NULL) != 0) {
++		printf("SWEET MDM: DATA: pdp_ip0: ifnet_attach failed\n");
++		pd.ifp = NULL;
++		return;
++	}
++	errno_t e4 = pd_attach_proto(PF_INET), e6 = pd_attach_proto(PF_INET6);
++	printf("SWEET MDM: DATA: pdp_ip0 attached (protocols IPv4 %d, IPv6 %d)\n", e4, e6);
++}
++
++static void
++pd_sin(struct sockaddr *sa, uint32_t a)
++{
++	struct sockaddr_in *s4 = (struct sockaddr_in *)sa;
++	s4->sin_len = sizeof(*s4);
++	s4->sin_family = AF_INET;
++	s4->sin_addr.s_addr = htonl(a);
++}
++
++/* the session's address on pdp_ip0 (the old one removed first), link up; or down (addr 0) */
++static void
++pd_configure(uint32_t addr)
++{
++	if (pd.ifp == NULL) {
++		return;
++	}
++	socket_t so = NULL;
++	errno_t e = sock_socket(PF_INET, SOCK_DGRAM, 0, NULL, NULL, &so);
++	if (e == 0 && pd.addr != 0 && pd.addr != addr) {
++		struct ifreq ifr;
++		bzero(&ifr, sizeof(ifr));
++		snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "pdp_ip0");
++		pd_sin(&ifr.ifr_addr, pd.addr);
++		(void)sock_ioctl(so, SIOCDIFADDR, &ifr);
++	}
++	if (e == 0 && addr != 0 && pd.addr != addr) {
++		struct ifaliasreq ifra;
++		bzero(&ifra, sizeof(ifra));
++		snprintf(ifra.ifra_name, sizeof(ifra.ifra_name), "pdp_ip0");
++		pd_sin(&ifra.ifra_addr, addr);
++		pd_sin(&ifra.ifra_broadaddr, mdd.gw);   /* the other end (point to point) */
++		pd_sin(&ifra.ifra_mask, 0xffffffffu);
++		e = sock_ioctl(so, SIOCAIFADDR, &ifra);
++	}
++	if (so != NULL) {
++		sock_close(so);
++	}
++	pd.addr = addr;
++	if (addr != 0) {
++		ifnet_set_mtu(pd.ifp, mdd.mtu >= 576 && mdd.mtu <= 1500 ? mdd.mtu : 1400);
++		ifnet_set_flags(pd.ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
++	} else {
++		ifnet_set_flags(pd.ifp, 0, IFF_RUNNING);
++	}
++	dlil_post_msg(pd.ifp, KEV_DL_SUBCLASS, addr ? KEV_DL_LINK_ON : KEV_DL_LINK_OFF, NULL, 0, FALSE);
++	printf("SWEET MDM: DATA: pdp_ip0 %s %s -> %s (err %d)\n", addr ? "up" : "down", addr ? mdd.a : "", addr ? mdd.g : "", e);
++}
++
++/* a packet from the modem to the stack */
++static void
++pd_input(const uint8_t *p, unsigned n)
++{
++	if (pd.ifp == NULL || pd.addr == 0) {
++		return;
++	}
++	if (n > 2048) {
++		pd.big++;
++		return;
++	}
++	mbuf_t m = NULL;
++	if (mbuf_gethdr(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) == 0 && mbuf_mclget(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) == 0 &&
++	    (mbuf_flags(m) & MBUF_EXT) && mbuf_maxlen(m) >= n) {
++		struct ifnet_stat_increment_param st = {};      /* counted by pd_proto_input */
++		memcpy(mbuf_data(m), p, n);
++		mbuf_setlen(m, n);
++		mbuf_pkthdr_setlen(m, n);
++		mbuf_pkthdr_setrcvif(m, pd.ifp);
++		mbuf_pkthdr_setheader(m, mbuf_data(m));
++		pd.in++;
++		ifnet_input(pd.ifp, m, &st);
++	} else if (m != NULL) {
++		mbuf_freem(m);
++	}
++}
++
++/* the stack's queued packets to the modem (from the modem thread) */
++static void
++pd_drain(void)
++{
++	static uint8_t b[MH_DA_LEN];
++	for (unsigned i = 0; i < PD_Q && pd.lock != NULL; ++i) {
++		lck_mtx_lock(pd.lock);
++		if (pd.count == 0) {
++			lck_mtx_unlock(pd.lock);
++			break;
++		}
++		mbuf_t m = pd.q[pd.head];
++		pd.head = (pd.head + 1) % PD_Q;
++		pd.count--;
++		lck_mtx_unlock(pd.lock);
++		size_t n = mbuf_pkthdr_len(m);
++		if (n <= sizeof(b) - 4 && mbuf_copydata(m, 0, n, b) == 0 && mx_data_send(b, (unsigned)n)) {
++			pd.out++;
++			ifnet_stat_increment_out(pd.ifp, 1, (u_int32_t)n, 0);
++		} else {
++			ifnet_stat_increment_out(pd.ifp, 0, 0, 1);
++		}
++		mbuf_freem(m);
++	}
++}
++
+ /* one IP packet from the modem */
+ static void
+ mx_data_ip(const uint8_t *p, unsigned n)
+ {
+ 	mxd.rx++;
+ 	mxd.rx_bytes += n;
++	pd_input(p, n);
+ 	if (n >= 20 && (p[0] >> 4) == 4) {
+ 		unsigned hl = (p[0] & 0xf) * 4u, proto = p[9];
+ 		if (mxd.logged < 20) {
+@@ -2697,16 +2977,27 @@ mx_data_poll(unsigned t_ms)
+ 	if (mxd.test_at == 0) {
+ 		mxd.test_at = t_ms + 2000;
+ 	}
++	if (pd.ifp == NULL && pd.lock == NULL) {
++		pd_create();
++	}
++	if (pd.addr != mdd.addr) {
++		pd_configure(mdd.addr);
++	}
++	pd_drain();
+ 	if (mxd.tests < 3 && t_ms >= mxd.test_at) {
+ 		mxd.test_at = t_ms + 20000;
+ 		mx_data_test();
+ 	}
+-	static unsigned next;
++	static unsigned next, next_log;
+ 	if (t_ms >= next) {
+-		next = t_ms + 60000;
+-		snprintf(sweet_cell_data, sizeof(sweet_cell_data), "data=up rx=%u/%u tx=%u/%u cmds=%u drops=%u dns=%u", mxd.rx,
+-		    mxd.rx_bytes, mxd.tx, mxd.tx_bytes, mxd.cmds, mxd.drops, mxd.answers);
+-		printf("SWEET MDM: DATA: %s\n", sweet_cell_data);
++		next = t_ms + 5000;             /* the string sweet-telephonyd reads (every 5 s); the log every 60 s */
++		snprintf(sweet_cell_data, sizeof(sweet_cell_data), "data=up if=%s addr=%s gw=%s mask=%s dns=%s,%s mtu=%u "
++		    "rx=%u/%u tx=%u/%u cmds=%u drops=%u/%u answers=%u", pd.addr ? "pdp_ip0" : "-", mdd.a, mdd.g, mdd.mk, mdd.d1, mdd.d2,
++		    mdd.mtu, mxd.rx, mxd.rx_bytes, mxd.tx, mxd.tx_bytes, mxd.cmds, mxd.drops, pd.qdrops, mxd.answers);
++		if (t_ms >= next_log) {
++			next_log = t_ms + 60000;
++			printf("SWEET MDM: DATA: %s\n", sweet_cell_data);
++		}
+ 	}
+ }
+ 
+@@ -3159,6 +3450,7 @@ md_mission(void)
+ 	(void)PE_parse_boot_argn("sweetmdmrestart", &maxr, sizeof(maxr));
+ 	if ((mq.restart_wanted || mx.gone) && restarts < maxr) {
+ 		restarts++;
++		pd_configure(0);
+ 		bzero(&mdd, sizeof(mdd));
+ 		bzero(&mxd, sizeof(mxd));
+ 		snprintf(sweet_cell_data, sizeof(sweet_cell_data), "data=off");
+-- 
+2.54.0 (Apple Git-157)
+
