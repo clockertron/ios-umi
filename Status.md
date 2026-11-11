@@ -25,7 +25,7 @@
 | 🔊 Audio | Speaker works (ringtones, system sounds); no microphones, earpiece not used | ⚠️ |
 | 🛜 WiFi | 2.4 GHz, open + WPA2-PSK, legacy rates | ⚠️ |
 | 🦷 Bluetooth | QCA6390 over UART (921600 baud): scan, connect and pair in Settings, Control Center button, off / on (slow); see the tests below | ⚠️ |
-| 📶 Cellular Data | The X55 modem boots from the kernel and stays registered on LTE with the SIM (kernels 0272-0273); the status bar shows the carrier (Sunrise) with signal bars through sweet-telephonyd, the CommCenter stand-in. **Mobile data works: Safari loads pages over LTE with Wi-Fi off**, status bar shows LTE (kernel 0277/0278: `pdp_ip0`; sweet-telephonyd publishes the service to configd). IPv4 only: this SIM's profile refuses IPv6; calls and SMS are not planned | ⚠️ |
+| 📶 Cellular Data | The X55 modem boots from the kernel and stays registered on LTE with the SIM (kernels 0272-0273); the status bar shows the carrier (Sunrise) with signal bars through sweet-telephonyd, the CommCenter stand-in. **Mobile data works: Safari loads pages over LTE with Wi-Fi off**, status bar shows LTE (kernel 0277/0278: `pdp_ip0`; sweet-telephonyd publishes the service to configd). IPv4 only: Sunrise has no IPv6 (the kernel's IPv6 path is there for carriers that do); calls and SMS are not planned | ⚠️ |
 | 📍 Location | Works through Wi-Fi positioning (Weather shows the city, Maps asks for permission) | ✅ |
 | 🛰️ GPS | No GPS receiver driver yet; location comes from Wi-Fi | ❌ |
 | 🪵 USB | Device mode (USB Ethernet + kernel log) for development; no host / iTunes | ⚠️ |

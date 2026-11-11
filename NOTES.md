@@ -20,8 +20,8 @@
     address / prefix), IPv6 packets on mux 2, the stack's Neighbor Solicitations answered locally with a Neighbor
     Advertisement (XNU wants a neighbor cache on IFT_CELLULAR; an NA with no link-layer option is accepted on an
     interface with no link address; DAD's are not answered); kern.sweet_cell_data gains addr6 / gw6 / dns6 / plen6
-    and sweet-telephonyd publishes State:/.../IPv6 and the IPv6 DNS. Next option (not done): WDS Modify Profile to
-    IPv4v6 (modem EFS = our RAM store, nothing written to the phone).
+    and sweet-telephonyd publishes State:/.../IPv6 and the IPv6 DNS. **Sunrise does not offer IPv6 (user), so the
+    profile switch to IPv4v6 is pointless here; the IPv6 path stays for a carrier that has it.**
   - USB networking stopped once mid-boot again (0277b, 20:22): the Mac's address vanished and the gadget did not
     come back until the next boot - an ECM gadget bug to look at.
 - **2026-11-11 20:25: 🎉 MOBILE DATA WORKS - Safari loads pages over LTE (Sunrise) with Wi-Fi off** (user: "Safari
