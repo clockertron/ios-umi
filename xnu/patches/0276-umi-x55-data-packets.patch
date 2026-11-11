@@ -1,0 +1,396 @@
+From 5ac377db9a6b38c65d73205709395b4760c03ff8 Mon Sep 17 00:00:00 2001
+From: qualcomm-toolbox <169756160+qcom-toolbox@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 19:46:48 +0100
+Subject: [PATCH] umi: X55 mobile data stage B: IP_HW0 channels 100/101 on
+ hardware event rings 7/8 (burst mode, 64 elements), QMAP framing, kernel DNS
+ test - answered over LTE (0276)
+
+---
+ bsd/dev/sweet_mdm.c | 312 +++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 307 insertions(+), 5 deletions(-)
+
+diff --git a/bsd/dev/sweet_mdm.c b/bsd/dev/sweet_mdm.c
+index 2be48cd..50ef2fa 100644
+--- a/bsd/dev/sweet_mdm.c
++++ b/bsd/dev/sweet_mdm.c
+@@ -619,8 +619,23 @@ md_sbl1(void)
+ 
+ #define MH_OFF          0x200000u       /* in the pool: after sbl1 */
+ #define MH_CHCTX        0x0000u         /* 128 x 44 */
+-#define MH_ERCTX        0x2000u         /* 2 x 44 */
+-#define MH_CMDCTX       0x2100u
++#define MH_ERCTX        0x2000u         /* MH_NER x 44 */
++#define MH_CMDCTX       0x2400u         /* (0x2100 until 0275: 9 event ring contexts need 0x18c bytes) */
++#define MH_NER          9u              /* event rings 0 (control), 1 (data), 2..6 (unused), 7 / 8 (IP_HW0) */
++#define MH_NHWER        2u              /* the last two are hardware rings (the device tree: mhi,hw-ev) */
++#define MX_DATA_UL      100u            /* IP_HW0: the modem's hardware IP channel (live FDT mhi_chan@100 / 101) */
++#define MX_DATA_DL      101u
++#define MH_ERX          0x50000u        /* event rings 2..6: 16 x 16 each, never used */
++#define MH_TRE_DA_OUT   0x52000u        /* channel 100: 64 x 16 */
++#define MH_TRE_DA_IN    0x52400u        /* channel 101: 64 x 16 */
++#define MH_ER7          0x54000u        /* 1024 x 16: IP_HW0 uplink completions (the device tree's size) */
++#define MH_ER8          0x58000u        /* 2048 x 16: IP_HW0 downlink */
++#define MH_ER7_N        1024u
++#define MH_ER8_N        2048u
++#define MH_DABUF        0x60000u        /* downlink: 64 x 8 KiB */
++#define MH_DATX         0xe0000u        /* uplink: 64 x 8 KiB */
++#define MH_DA_N         64u             /* elements of the IP_HW0 channels (the OnePlus port's 64; 0276's 16: 101 did not start) */
++#define MH_DA_LEN       0x2000u
+ #define MH_ER0          0x3000u         /* 32 x 16: control */
+ #define MH_ER1          0x4000u         /* 256 x 16: data */
+ #define MH_CMD          0x5000u         /* 64 x 16 */
+@@ -787,6 +802,18 @@ mhi_init(bool mission)
+ 	}
+ 	mx_ctx(MH_ERCTX, 0, 1, 1, MH_ER0, MH_ER0_N * MH_EL, MH_ER0 + (MH_ER0_N - 1) * MH_EL);
+ 	mx_ctx(MH_ERCTX + 44, 1u << 16, 1, 2, MH_ER1, MH_ER1_N * MH_EL, MH_ER1 + (MH_ER1_N - 1) * MH_EL);
++	/* 0275b: rings 2..8 as the device tree's (IP_HW0 = channels 100 / 101 on the hardware rings 7 / 8, burst mode),
++	   for mobile data; set up from the start like the others (the SBL session carries on into AMSS) */
++	bzero((void *)(mx.mem + MH_ERX), MH_DABUF - MH_ERX);
++	for (unsigned e = 2; e < 7; ++e) {
++		uint32_t r = MH_ERX + (e - 2) * 16u * MH_EL;
++		mx_ctx(MH_ERCTX + e * 44u, 0, 1, 1, r, 16u * MH_EL, r + 15u * MH_EL);
++	}
++	/* moderation 5 ms and MSI vectors 5 / 6 as the device tree's rings 7 / 8 */
++	mx_ctx(MH_ERCTX + 7 * 44u, 5u << 16, 1, 5, MH_ER7, MH_ER7_N * MH_EL, MH_ER7 + (MH_ER7_N - 1) * MH_EL);
++	mx_ctx(MH_ERCTX + 8 * 44u, 5u << 16, 1, 6, MH_ER8, MH_ER8_N * MH_EL, MH_ER8 + (MH_ER8_N - 1) * MH_EL);
++	mx_ctx(MH_CHCTX + MX_DATA_UL * 44u, 3u << 8, 1, 7, 0, 0, 0);
++	mx_ctx(MH_CHCTX + MX_DATA_DL * 44u, 3u << 8, 2, 8, 0, 0, 0);
+ 	mx_ctx(MH_CMDCTX, 0, 0, 0, MH_CMD, MH_CMD_N * MH_EL, MH_CMD);
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	mx.er0_rp = mx.er1_rp = mx.cmd_wp = mx.out_wp = mx.in_wp = 0;
+@@ -801,9 +828,12 @@ mhi_init(bool mission)
+ 	mx_db(MHI_DATABASE, 0);
+ 	mx_db(MHI_CTRLLIMIT, 0xffffffffu);
+ 	mx_db(MHI_DATALIMIT, 0xffffffffu);
+-	md_wr(md.bar0, MHI_CFG, (md_rd(md.bar0, MHI_CFG) & ~0xffff0000u) | (2u << 16));
++	md_wr(md.bar0, MHI_CFG, (md_rd(md.bar0, MHI_CFG) & ~0xffff0000u) | (MH_NER << 16) | (MH_NHWER << 24));
+ 	mx_db(mx.erdb, mx.pa + MH_ER0 + (MH_ER0_N - 1) * MH_EL);
+ 	mx_db(mx.erdb + 8, mx.pa + MH_ER1 + (MH_ER1_N - 1) * MH_EL);
++	for (unsigned e = 2; e < MH_NER; ++e) {
++		mx_db(mx.erdb + 8u * e, mx_rd64(MH_ERCTX + e * 44u + 36));
++	}
+ 	md_wr(md.bar0, MHI_CTRL, (md_rd(md.bar0, MHI_CTRL) & ~0xff00u) | (2u << 8));      /* M0 */
+ 	printf("SWEET MDM: MHI contexts at %#x, M0 requested (chdb %#x erdb %#x cfg %#x)\n", mx.pa, mx.chdb, mx.erdb,
+ 	    md_rd(md.bar0, MHI_CFG));
+@@ -824,9 +854,9 @@ mhi_init(bool mission)
+ }
+ 
+ static int
+-mx_chan_start(unsigned ch, bool in, uint32_t ring)
++mx_chan_start_er(unsigned ch, bool in, uint32_t ring, unsigned er, unsigned burst, unsigned elements)
+ {
+-	mx_ctx(MH_CHCTX + ch * 44u, 1u | (2u << 8), in ? 2u : 1u, 1, ring, MH_TRE_N * MH_EL, ring);
++	mx_ctx(MH_CHCTX + ch * 44u, 1u | (burst << 8), in ? 2u : 1u, er, ring, elements * MH_EL, ring);
+ 	mx_tre(MH_CMD + mx.cmd_wp * MH_EL, 0, 0, ch << 24 | 0x12u << 16);
+ 	mx.cmd_wp = (mx.cmd_wp + 1) % MH_CMD_N;
+ 	uint64_t a = mx.pa + MH_CMD + mx.cmd_wp * MH_EL;
+@@ -841,6 +871,12 @@ mx_chan_start(unsigned ch, bool in, uint32_t ring)
+ 	return mx.cmd_code == 1 ? 0 : 23;
+ }
+ 
++static int
++mx_chan_start(unsigned ch, bool in, uint32_t ring)
++{
++	return mx_chan_start_er(ch, in, ring, 1, 2, MH_TRE_N);
++}
++
+ static void
+ mx_ring(unsigned ch, uint32_t ring, uint32_t wp)
+ {
+@@ -2415,6 +2451,265 @@ mx_data_rx(uint32_t svc, unsigned msg, const uint8_t *m, uint32_t len, unsigned
+ 	return true;
+ }
+ 
++/*
++ * ---- mobile data, stage B: packets on IP_HW0 (MHI 100 to the modem, 101 from it) ----
++ * Started once the session is up: both channels in burst mode on the hardware event rings 7 / 8, 15 downlink buffers
++ * of 8 KiB queued. Each packet is QMAP v1 framed (4 bytes: command bit + pad length, mux id, big-endian length with
++ * the pad), the modem may put several in one buffer. The test: a DNS query (A of example.com) to the session's first
++ * DNS server, sent from inside the kernel 2 s after the start and every 20 s, 3 times; every packet received is
++ * counted, the first 20 logged, a DNS answer decoded.
++ */
++static struct {
++	bool started, failed;
++	uint32_t er7_rp, er7_wp, er8_rp, er8_wp, out_wp, ul_done, in_wp;
++	unsigned rx, tx, rx_bytes, tx_bytes, cmds, drops, logged, tests, answers;
++	unsigned test_at;
++	uint16_t ip_id;
++} mxd;
++
++static uint16_t
++mx_csum(const uint8_t *p, unsigned n)
++{
++	uint32_t sum = 0;
++	for (unsigned i = 0; i + 1 < n; i += 2) {
++		sum += (uint32_t)(p[i] << 8 | p[i + 1]);
++	}
++	if (n & 1) {
++		sum += (uint32_t)p[n - 1] << 8;
++	}
++	while (sum >> 16) {
++		sum = (sum & 0xffff) + (sum >> 16);
++	}
++	return (uint16_t)~sum;
++}
++
++/* One IP packet to the modem (QMAP mux 1); false when the uplink ring is full. */
++static bool
++mx_data_send(const uint8_t *ip, unsigned n)
++{
++	if (!mxd.started || n + 4 > MH_DA_LEN || ((mxd.out_wp + 1) % MH_DA_N) == mxd.ul_done) {
++		mxd.drops++;
++		return false;
++	}
++	unsigned slot = mxd.out_wp;
++	uint8_t *b = (uint8_t *)(mx.mem + MH_DATX + slot * MH_DA_LEN);
++	b[0] = 0;
++	b[1] = 1;
++	b[2] = (uint8_t)(n >> 8);
++	b[3] = (uint8_t)n;
++	memcpy(b + 4, ip, n);
++	mx_tre(MH_TRE_DA_OUT + slot * MH_EL, mx.pa + MH_DATX + slot * MH_DA_LEN, n + 4, 0x2u << 16 | 1u << 9);
++	mxd.out_wp = (mxd.out_wp + 1) % MH_DA_N;
++	mx_ring(MX_DATA_UL, MH_TRE_DA_OUT, mxd.out_wp);
++	mxd.tx++;
++	mxd.tx_bytes += n;
++	return true;
++}
++
++static void
++mx_data_dl_queue(unsigned b)
++{
++	mx_tre(MH_TRE_DA_IN + mxd.in_wp * MH_EL, mx.pa + MH_DABUF + b * MH_DA_LEN, MH_DA_LEN, 0x2u << 16 | 1u << 9);
++	mxd.in_wp = (mxd.in_wp + 1) % MH_DA_N;
++	mx_ring(MX_DATA_DL, MH_TRE_DA_IN, mxd.in_wp);
++}
++
++/* the DNS query of the test: A record of example.com, id 0x5357, from port 50003 */
++static void
++mx_data_test(void)
++{
++	static const uint8_t q[] = { 0x53, 0x57, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0, 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e',
++		                     3, 'c', 'o', 'm', 0, 0, 1, 0, 1 };
++	uint8_t p[20 + 8 + sizeof(q)];
++	unsigned n = sizeof(p);
++	bzero(p, 28);
++	p[0] = 0x45;
++	p[2] = (uint8_t)(n >> 8);
++	p[3] = (uint8_t)n;
++	mxd.ip_id++;
++	p[4] = (uint8_t)(mxd.ip_id >> 8);
++	p[5] = (uint8_t)mxd.ip_id;
++	p[8] = 64;
++	p[9] = 17;
++	uint32_t src = mdd.addr, dst = mdd.dns1;
++	p[12] = (uint8_t)(src >> 24); p[13] = (uint8_t)(src >> 16); p[14] = (uint8_t)(src >> 8); p[15] = (uint8_t)src;
++	p[16] = (uint8_t)(dst >> 24); p[17] = (uint8_t)(dst >> 16); p[18] = (uint8_t)(dst >> 8); p[19] = (uint8_t)dst;
++	uint16_t c = mx_csum(p, 20);
++	p[10] = (uint8_t)(c >> 8);
++	p[11] = (uint8_t)c;
++	p[20] = 0xc3; p[21] = 0x53;             /* source port 50003 */
++	p[22] = 0; p[23] = 53;
++	p[24] = (uint8_t)((n - 20) >> 8);
++	p[25] = (uint8_t)(n - 20);              /* UDP checksum 0: none (IPv4) */
++	memcpy(p + 28, q, sizeof(q));
++	mxd.tests++;
++	printf("SWEET MDM: DATA: test %u: DNS query for example.com to the session's DNS server: %s\n", mxd.tests,
++	    mx_data_send(p, n) ? "sent" : "NOT sent (ring full)");
++}
++
++/* one IP packet from the modem */
++static void
++mx_data_ip(const uint8_t *p, unsigned n)
++{
++	mxd.rx++;
++	mxd.rx_bytes += n;
++	if (n >= 20 && (p[0] >> 4) == 4) {
++		unsigned hl = (p[0] & 0xf) * 4u, proto = p[9];
++		if (mxd.logged < 20) {
++			mxd.logged++;
++			printf("SWEET MDM: DATA: in: IPv4 %u bytes, protocol %u, from %u.%u.%u.%u\n", n, proto, p[12], p[13], p[14],
++			    p[15]);
++		}
++		/* the test's answer: UDP from port 53 to 50003, id 0x5357 */
++		if (proto == 17 && n >= hl + 8 + 12 && p[hl] == 0 && p[hl + 1] == 53 && p[hl + 2] == 0xc3 && p[hl + 3] == 0x53) {
++			const uint8_t *d = p + hl + 8;
++			unsigned dn = n - hl - 8, an = d[6] << 8 | d[7], rcode = d[3] & 0xf;
++			mxd.answers++;
++			/* skip the question, then the answers: the first A record */
++			unsigned o = 12;
++			while (o < dn && d[o] != 0) {
++				o += (d[o] & 0xc0) ? 1 : d[o] + 1u;
++			}
++			o += 5;
++			char a[16] = "-";
++			for (unsigned i = 0; i < an && o + 12 <= dn; ++i) {
++				if ((d[o] & 0xc0) == 0xc0) {
++					o += 2;
++				} else {
++					while (o < dn && d[o] != 0) {
++						o += d[o] + 1u;
++					}
++					o++;
++				}
++				if (o + 10 > dn) {
++					break;
++				}
++				unsigned type = d[o] << 8 | d[o + 1], rl = d[o + 8] << 8 | d[o + 9];
++				o += 10;
++				if (type == 1 && rl == 4 && o + 4 <= dn) {
++					snprintf(a, sizeof(a), "%u.%u.%u.%u", d[o], d[o + 1], d[o + 2], d[o + 3]);
++					break;
++				}
++				o += rl;
++			}
++			printf("SWEET MDM: DATA: DNS ANSWER over mobile data: rcode %u, %u answer(s), example.com A %s\n", rcode, an, a);
++		}
++	} else if (n >= 40 && (p[0] >> 4) == 6 && mxd.logged < 20) {
++		mxd.logged++;
++		printf("SWEET MDM: DATA: in: IPv6 %u bytes, next header %u\n", n, p[6]);
++	}
++}
++
++/* what one downlink buffer held: QMAP frames */
++static void
++mx_data_in(const uint8_t *p, uint32_t n)
++{
++	for (uint32_t o = 0; o + 4 <= n;) {
++		unsigned pad = p[o] & 0x3f, len = (unsigned)(p[o + 2] << 8 | p[o + 3]);
++		if (len == 0 || o + 4 + len > n) {
++			break;
++		}
++		if (p[o] & 0x80) {
++			mxd.cmds++;                     /* a QMAP command (flow control): counted */
++		} else if (len > pad) {
++			mx_data_ip(p + o + 4, len - pad);
++		}
++		o += 4 + len;
++	}
++}
++
++/* events of the hardware rings 7 (uplink done) and 8 (downlink) */
++static void
++mx_data_er(unsigned e, uint32_t ring, uint32_t n, uint32_t *rp, uint32_t *wp)
++{
++	uint32_t ctx = MH_ERCTX + e * 44u;
++	for (;;) {
++		uint32_t idx = (uint32_t)((mx_rd64(ctx + 28) - (mx.pa + ring)) / MH_EL);
++		if (idx >= n || *rp == idx) {
++			break;
++		}
++		uint32_t ev = ring + *rp * MH_EL;
++		uint64_t ptr = mx_rd64(ev);
++		uint32_t d0 = mx32(ev)[2], d1 = mx32(ev)[3];
++		unsigned type = (d1 >> 16) & 0xff, ch = d1 >> 24, code = d0 >> 24, len = d0 & 0xffff;
++		if (type == 0x22 && ch == MX_DATA_DL && (code == 1 || code == 2 || code == 3)) {
++			unsigned slot = (unsigned)((ptr - (mx.pa + MH_TRE_DA_IN)) / MH_EL);
++			uint64_t buf = slot < MH_DA_N ? mx_rd64(MH_TRE_DA_IN + slot * MH_EL) : 0;
++			unsigned b = (unsigned)((buf - (mx.pa + MH_DABUF)) / MH_DA_LEN);
++			if (b < MH_DA_N && len <= MH_DA_LEN) {
++				mx_data_in((const uint8_t *)(mx.mem + MH_DABUF + b * MH_DA_LEN), len);
++				mx_data_dl_queue(b);
++			}
++		} else if (type == 0x22 && ch == MX_DATA_UL) {
++			unsigned slot = (unsigned)((ptr - (mx.pa + MH_TRE_DA_OUT)) / MH_EL);
++			if (slot < MH_DA_N) {
++				mxd.ul_done = (slot + 1) % MH_DA_N;
++			}
++		} else if (mxd.logged < 20) {
++			mxd.logged++;
++			printf("SWEET MDM: DATA: event ring %u: type %#x ch %u code %u len %u\n", e, type, ch, code, len);
++		}
++		*rp = (*rp + 1) % n;
++		*wp = (*wp + 1) % n;
++		uint64_t w = mx.pa + ring + *wp * MH_EL;
++		mx64(ctx + 36, w);
++		mx_db(mx.erdb + 8u * e, w);
++	}
++}
++
++/* At mission start with the other channels (sweetmdm=10): IP_HW0 in burst mode on the hardware rings; a channel that
++   does not start is logged and the rest goes on (the data session still comes up) */
++static void
++mx_data_start(void)
++{
++	mxd.er7_rp = mxd.er8_rp = 0;
++	mxd.er7_wp = MH_ER7_N - 1;
++	mxd.er8_wp = MH_ER8_N - 1;
++	int u = mx_chan_start_er(MX_DATA_UL, false, MH_TRE_DA_OUT, 7, 3, MH_DA_N);
++	int d = mx_chan_start_er(MX_DATA_DL, true, MH_TRE_DA_IN, 8, 3, MH_DA_N);
++	if (u || d) {
++		printf("SWEET MDM: DATA: IP_HW0 start: uplink %d downlink %d - no packets this run\n", u, d);
++		mxd.failed = true;
++		return;
++	}
++	mxd.started = true;
++	mxd.out_wp = mxd.ul_done = mxd.in_wp = 0;
++	for (unsigned b = 0; b < MH_DA_N - 1; ++b) {
++		mx_data_dl_queue(b);
++	}
++	printf("SWEET MDM: DATA: IP_HW0 (100 / 101) started, %u downlink buffers queued\n", MH_DA_N - 1);
++}
++
++/* from the modem thread's loop: poll the hardware rings; the test once the session is up */
++static void
++mx_data_poll(unsigned t_ms)
++{
++	if (mxd.started) {
++		mx_data_er(7, MH_ER7, MH_ER7_N, &mxd.er7_rp, &mxd.er7_wp);
++		mx_data_er(8, MH_ER8, MH_ER8_N, &mxd.er8_rp, &mxd.er8_wp);
++	}
++	if (!mdd.up || mxd.failed) {
++		return;
++	}
++	if (!mxd.started) {
++		return;
++	}
++	if (mxd.test_at == 0) {
++		mxd.test_at = t_ms + 2000;
++	}
++	if (mxd.tests < 3 && t_ms >= mxd.test_at) {
++		mxd.test_at = t_ms + 20000;
++		mx_data_test();
++	}
++	static unsigned next;
++	if (t_ms >= next) {
++		next = t_ms + 60000;
++		snprintf(sweet_cell_data, sizeof(sweet_cell_data), "data=up rx=%u/%u tx=%u/%u cmds=%u drops=%u dns=%u", mxd.rx,
++		    mxd.rx_bytes, mxd.tx, mxd.tx_bytes, mxd.cmds, mxd.drops, mxd.answers);
++		printf("SWEET MDM: DATA: %s\n", sweet_cell_data);
++	}
++}
++
+ static void
+ mx_qmi_rx(uint32_t node, uint32_t port, const uint8_t *m, uint32_t len)
+ {
+@@ -2799,6 +3094,9 @@ md_mission(void)
+ 		mx_rx_queue(b);
+ 	}
+ 	printf("SWEET MDM: IPCR channels %u/%u running: QRTR HELLO sent\n", MX_IPCR_OUT, MX_IPCR_IN);
++	if (md.stage >= 10) {
++		mx_data_start();
++	}
+ 	if (md.stage >= 8) {
+ 		mx_sfr_cfg();
+ 		dg_start();
+@@ -2834,6 +3132,7 @@ md_mission(void)
+ 		}
+ 		if (md.stage >= 8) {
+ 			mx_qmi_survey(t);
++			mx_data_poll(t);
+ 		}
+ 		if (t >= next_status) {
+ 			next_status = t + status_every;
+@@ -2860,6 +3159,9 @@ md_mission(void)
+ 	(void)PE_parse_boot_argn("sweetmdmrestart", &maxr, sizeof(maxr));
+ 	if ((mq.restart_wanted || mx.gone) && restarts < maxr) {
+ 		restarts++;
++		bzero(&mdd, sizeof(mdd));
++		bzero(&mxd, sizeof(mxd));
++		snprintf(sweet_cell_data, sizeof(sweet_cell_data), "data=off");
+ 		unsigned files = 0;
+ 		for (unsigned i = 0; i < MT_STORE_N; ++i) {
+ 			if (mts[i].data != NULL) {
+-- 
+2.54.0 (Apple Git-157)
+

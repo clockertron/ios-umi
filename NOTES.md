@@ -2,6 +2,21 @@
 
 ## umi (Xiaomi Mi 10, SM8250) port - branch `umi` on qcom-toolbox/ios-sweet (2026-10-20)
 
+- **2026-11-11 19:45: MOBILE DATA STAGE B - PACKETS BOTH WAYS: a DNS query sent by the kernel over LTE got its answer**
+  (patch `xnu/patches/0276-umi-x55-data-packets.patch`; image `shim/out/umi-0276b-data-packets.img`, `sweetmdm=10`).
+  - MHI now has 9 event rings (MHICFG NER 9, NHWER 2; the command context moved 0x2100 -> 0x2400 to make room): 0
+    control, 1 data, 2..6 unused (16 elements), **7 / 8 the hardware rings of IP_HW0** (1024 / 2048 elements,
+    moderation 5, MSI vectors 5 / 6 as the device tree). Channels **100 (uplink) / 101 (downlink)** in burst mode 3,
+    **64 elements**, started at mission start next to IPCR (stage >= 10); 63 downlink buffers of 8 KiB queued.
+  - First try (0276: 16 elements, rings 64 / 128, started after the session): 100 started, **101's START command never
+    completed** (no error either). With the OnePlus port's sizes and the start at mission (0276b) both start (state 2).
+    No IPA QMI handshake needed (as the OnePlus notes say).
+  - QMAP v1 both ways (4 bytes: command bit + pad, mux id 1, big-endian length incl. pad); downlink buffers may hold
+    several frames, commands (flow control) counted. Test: a DNS A query for example.com to the session's first DNS
+    server, built in the kernel 2 s after the session: **the answer came back (rcode 0, 2 answers, an A record)**.
+  - `kern.sweet_cell_data` every minute: rx / tx packets and bytes, QMAP commands, drops, DNS answers.
+  - Next, stage C: a network interface for iOS (pdp_ip0-like) carrying these packets, configured with the session's
+    address / DNS, and how iOS picks it as a route.
 - **2026-11-10 23:00: MOBILE DATA STAGE A - Sunrise gives an IPv4 data session** (patch
   `xnu/patches/0275-umi-x55-data-session.patch`, kernel 7104ab7; image `shim/out/umi-0275-data-session.img` = 0273b's
   line with `sweetmdm=10` (= service mode 9 + data; a separate boot-arg did not fit: 613 > 607 characters); no ADT
