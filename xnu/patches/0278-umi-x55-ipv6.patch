@@ -1,0 +1,439 @@
+From f27cc681fcd1c5864c40cda9106516356132ed83 Mon Sep 17 00:00:00 2001
+From: qualcomm-toolbox <169756160+qcom-toolbox@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 20:38:56 +0100
+Subject: [PATCH] umi: X55 mobile data IPv6 (0278): second WDS client on mux 2
+ (family 6), IPv6 on pdp_ip0 (attach, link-local, session address), Neighbor
+ Solicitations answered locally, IPv6 on QMAP mux 2; refused on an IPv4-only
+ profile (reason 210), IPv4 unaffected
+
+---
+ bsd/dev/sweet_mdm.c | 270 +++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 255 insertions(+), 15 deletions(-)
+
+diff --git a/bsd/dev/sweet_mdm.c b/bsd/dev/sweet_mdm.c
+index 0e014f4..22f3e67 100644
+--- a/bsd/dev/sweet_mdm.c
++++ b/bsd/dev/sweet_mdm.c
+@@ -71,6 +71,9 @@
+ #include <net/kpi_protocol.h>
+ #include <net/dlil.h>
+ #include <netinet/in.h>
++#include <netinet6/in6_var.h>
++#include <netinet/ip6.h>
++#include <netinet/icmp6.h>
+ #include <sys/kern_event.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+@@ -1765,6 +1768,7 @@ static void mx_qmi_rx(uint32_t node, uint32_t port, const uint8_t *m, uint32_t l
+  * Qualcomm's rsize / seek / wsize. Service announcement and path mapping as found by the OnePlus 8 Pro port. */
+ 
+ #define MX_TFTP_PORT    0x4002u
++#define MX_QMI6_PORT    0x4003u         /* the second WDS client: the IPv6 data session (WDS clients are per port) */
+ #define MX_TFTP_SERVICE 0x1000u
+ 
+ static struct {
+@@ -2085,6 +2089,8 @@ mt_announce(uint32_t node)
+ }
+ 
+ 
++static void mx_data6_rx(const uint8_t *m, uint32_t len);
++
+ static void
+ mx_qrx(const uint8_t *p, uint32_t len)
+ {
+@@ -2161,7 +2167,9 @@ mx_qrx(const uint8_t *p, uint32_t len)
+ 			uint32_t r[5] = { 7, MX_QNODE, h.dst_port, 0, 0 };
+ 			mx_qpkt(7, h.dst_port, h.src_node, h.src_port, false, r, 5);
+ 		}
+-		if (h.dst_port == MX_QMI_PORT && h.size <= len - hl) {
++		if (h.dst_port == MX_QMI6_PORT && h.size <= len - hl) {
++			mx_data6_rx(p + hl, h.size);
++		} else if (h.dst_port == MX_QMI_PORT && h.size <= len - hl) {
+ 			mx_qmi_rx(h.src_node, h.src_port, p + hl, h.size);
+ 		} else if (h.dst_port == MX_TFTP_PORT && h.size <= len - hl) {
+ 			mt_rx(h.src_node, h.src_port, p + hl, h.size);
+@@ -2178,17 +2186,17 @@ mx_qrx(const uint8_t *p, uint32_t len)
+ 
+ /* One QRTR DATA packet from our QMI port, payload bytes as given. */
+ static void
+-mx_qdata(uint32_t dst_node, uint32_t dst_port, const uint8_t *pl, uint32_t n)
++mx_qdata_from(uint32_t src_port, uint32_t dst_node, uint32_t dst_port, const uint8_t *pl, uint32_t n)
+ {
+ 	uint8_t *p = (uint8_t *)(mx.mem + MH_TXBUF);
+ 	uint32_t hl;
+ 	if (mq.v2) {
+-		struct mx_qhdr2 h = { 3, 1, 1, 0, n, (uint16_t)MX_QNODE, (uint16_t)MX_QMI_PORT, (uint16_t)dst_node,
++		struct mx_qhdr2 h = { 3, 1, 1, 0, n, (uint16_t)MX_QNODE, (uint16_t)src_port, (uint16_t)dst_node,
+ 			              (uint16_t)dst_port };
+ 		memcpy(p, &h, sizeof(h));
+ 		hl = sizeof(h);
+ 	} else {
+-		uint32_t h[8] = { 1, 1, MX_QNODE, MX_QMI_PORT, 1, n, dst_node, dst_port };
++		uint32_t h[8] = { 1, 1, MX_QNODE, src_port, 1, n, dst_node, dst_port };
+ 		memcpy(p, h, sizeof(h));
+ 		hl = sizeof(h);
+ 	}
+@@ -2196,9 +2204,15 @@ mx_qdata(uint32_t dst_node, uint32_t dst_port, const uint8_t *pl, uint32_t n)
+ 	(void)mx_send((hl + n + 3) & ~3u);
+ }
+ 
+-/* A QMI request: header (type 0 request, txn, message id, length), then TLVs. */
+ static void
+-mx_qmi_req(uint32_t svc, uint16_t msg, const uint8_t *tlv, uint16_t tlvlen)
++mx_qdata(uint32_t dst_node, uint32_t dst_port, const uint8_t *pl, uint32_t n)
++{
++	mx_qdata_from(MX_QMI_PORT, dst_node, dst_port, pl, n);
++}
++
++/* A QMI request: header (type 0 request, txn, message id, length), then TLVs; from our port `from`. */
++static void
++mx_qmi_req_from(uint32_t from, uint32_t svc, uint16_t msg, const uint8_t *tlv, uint16_t tlvlen)
+ {
+ 	if (svc >= 0x60 || mq.svc_port[svc] == 0) {
+ 		printf("SWEET MDM: QMI: service %#x not announced\n", svc);
+@@ -2216,7 +2230,13 @@ mx_qmi_req(uint32_t svc, uint16_t msg, const uint8_t *tlv, uint16_t tlvlen)
+ 	if (tlv != NULL && tlvlen) {
+ 		memcpy(m + 7, tlv, MIN((size_t)tlvlen, sizeof(m) - 7));
+ 	}
+-	mx_qdata(mq.svc_node[svc], mq.svc_port[svc], m, 7u + tlvlen);
++	mx_qdata_from(from, mq.svc_node[svc], mq.svc_port[svc], m, 7u + tlvlen);
++}
++
++static void
++mx_qmi_req(uint32_t svc, uint16_t msg, const uint8_t *tlv, uint16_t tlvlen)
++{
++	mx_qmi_req_from(MX_QMI_PORT, svc, msg, tlv, tlvlen);
+ }
+ 
+ static const uint8_t *
+@@ -2327,7 +2347,7 @@ static struct {
+ 	char a[16], g[16], mk[16], d1[16], d2[16];
+ } mdd;
+ 
+-static char sweet_cell_data[256] = "data=off";
++static char sweet_cell_data[512] = "data=off";
+ SYSCTL_STRING(_kern, OID_AUTO, sweet_cell_data, CTLFLAG_RD | CTLFLAG_LOCKED, sweet_cell_data, sizeof(sweet_cell_data),
+     "sweet: the modem's mobile data session (sweetmdm=10)");
+ 
+@@ -2464,6 +2484,126 @@ mx_data_rx(uint32_t svc, unsigned msg, const uint8_t *m, uint32_t len, unsigned
+ 	return true;
+ }
+ 
++/*
++ * ---- mobile data, IPv6 (0278): a second WDS client (our QRTR port MX_QMI6_PORT) on QMAP mux 2 of the same data port,
++ * family 6 (the OnePlus 8 Pro port's order): Bind Mux Data Port (mux 2) -> Set IP Family 6 -> Start Network (0x19 = 6)
++ * -> Get Current Settings: 0x25 address + prefix length (17 bytes), 0x26 gateway (17), 0x27 / 0x28 DNS (16), 0x29 MTU.
++ * Started once the IPv4 session is up; a refused call is logged and tried again at most twice (60 s apart).
++ */
++static struct {
++	unsigned step, at, tries;
++	bool up;
++	uint8_t addr[16], gw[16], dns1[16], dns2[16];
++	unsigned plen;
++	uint32_t handle, mtu;
++	char a[48], g[48], d1[48], d2[48], p6[8];
++} mdd6;
++
++static void
++mx_data6_step(unsigned t_ms)
++{
++	if (!mdd.up || mdd6.up || (mdd6.step & 1) || t_ms < mdd6.at || mdd6.tries >= 3) {
++		return;
++	}
++	uint8_t t[32];
++	unsigned k = 0;
++	mdd6.at = t_ms + 30000;
++	switch (mdd6.step) {
++	case 0:
++		mdd6.tries++;
++		t[k++] = 0x10; t[k++] = 8; t[k++] = 0;
++		t[k++] = 3; t[k++] = 0; t[k++] = 0; t[k++] = 0; t[k++] = 4; t[k++] = 0; t[k++] = 0; t[k++] = 0;
++		mx_put8(t, &k, 0x11, 2);                /* mux id 2 */
++		printf("SWEET MDM: DATA6: WDS (second client) bind mux data port (mux 2), try %u\n", mdd6.tries);
++		mx_qmi_req_from(MX_QMI6_PORT, 0x01, 0xa2, t, (uint16_t)k);
++		break;
++	case 2:
++		mx_put8(t, &k, 0x01, 6);
++		mx_qmi_req_from(MX_QMI6_PORT, 0x01, 0x4d, t, (uint16_t)k);
++		break;
++	case 4:
++		mx_put8(t, &k, 0x19, 6);
++		printf("SWEET MDM: DATA6: WDS start network interface (IPv6)\n");
++		mx_qmi_req_from(MX_QMI6_PORT, 0x01, 0x20, t, (uint16_t)k);
++		break;
++	case 6:
++		mx_put32(t, &k, 0x10, 0xa310);
++		mx_qmi_req_from(MX_QMI6_PORT, 0x01, 0x2d, t, (uint16_t)k);
++		break;
++	default:
++		return;
++	}
++	mdd6.step++;
++}
++
++static void
++mx_data6_rx(const uint8_t *m, uint32_t len)
++{
++	if (len < 7) {
++		return;
++	}
++	unsigned type = m[0], msg = m[3] | m[4] << 8;
++	uint16_t tl = 0;
++	const uint8_t *r = mx_tlv(m, len, 0x02, &tl), *v;
++	unsigned res = r && tl >= 4 ? (unsigned)(r[0] | r[1] << 8) : 0xffff;
++	unsigned err = r && tl >= 4 ? (unsigned)(r[2] | r[3] << 8) : 0;
++	if (type != 2) {
++		printf("SWEET MDM: DATA6: WDS message %#x (type %u)\n", msg, type);
++		return;
++	}
++	unsigned want = mdd6.step;
++	if (!((msg == 0xa2 && want == 1) || (msg == 0x4d && want == 3) || (msg == 0x20 && want == 5) ||
++	    (msg == 0x2d && want == 7))) {
++		printf("SWEET MDM: DATA6: WDS %#x -> result %u error %u (not awaited)\n", msg, res, err);
++		return;
++	}
++	printf("SWEET MDM: DATA6: WDS %#x -> result %u error %u\n", msg, res, err);
++	if (res != 0) {
++		if (msg == 0x20) {
++			if ((v = mx_tlv(m, len, 0x10, &tl)) != NULL && tl >= 2) {
++				printf("SWEET MDM: DATA6: call end reason %u\n", v[0] | v[1] << 8);
++			}
++			if ((v = mx_tlv(m, len, 0x11, &tl)) != NULL && tl >= 4) {
++				printf("SWEET MDM: DATA6: verbose call end reason type %u reason %u\n", v[0] | v[1] << 8, v[2] | v[3] << 8);
++			}
++		}
++		mdd6.step = 0;
++		mdd6.at += 30000;               /* 60 s */
++		return;
++	}
++	if (msg == 0x20 && (v = mx_tlv(m, len, 0x01, &tl)) != NULL && tl >= 4) {
++		mdd6.handle = (uint32_t)v[0] | (uint32_t)v[1] << 8 | (uint32_t)v[2] << 16 | (uint32_t)v[3] << 24;
++		printf("SWEET MDM: DATA6: IPv6 session started (handle %#x)\n", mdd6.handle);
++	}
++	if (msg == 0x2d) {
++		if ((v = mx_tlv(m, len, 0x25, &tl)) != NULL && tl >= 17) {
++			memcpy(mdd6.addr, v, 16);
++			mdd6.plen = v[16];
++		}
++		if ((v = mx_tlv(m, len, 0x26, &tl)) != NULL && tl >= 16) {
++			memcpy(mdd6.gw, v, 16);
++		}
++		if ((v = mx_tlv(m, len, 0x27, &tl)) != NULL && tl >= 16) {
++			memcpy(mdd6.dns1, v, 16);
++		}
++		if ((v = mx_tlv(m, len, 0x28, &tl)) != NULL && tl >= 16) {
++			memcpy(mdd6.dns2, v, 16);
++		}
++		if ((v = mx_tlv(m, len, 0x29, &tl)) != NULL && tl >= 4) {
++			mdd6.mtu = (uint32_t)v[0] | (uint32_t)v[1] << 8 | (uint32_t)v[2] << 16 | (uint32_t)v[3] << 24;
++		}
++		inet_ntop(AF_INET6, mdd6.addr, mdd6.a, sizeof(mdd6.a));
++		inet_ntop(AF_INET6, mdd6.gw, mdd6.g, sizeof(mdd6.g));
++		inet_ntop(AF_INET6, mdd6.dns1, mdd6.d1, sizeof(mdd6.d1));
++		inet_ntop(AF_INET6, mdd6.dns2, mdd6.d2, sizeof(mdd6.d2));
++		snprintf(mdd6.p6, sizeof(mdd6.p6), "%u", mdd6.plen);
++		printf("SWEET MDM: DATA6: UP: /%u, mtu %u (addresses in kern.sweet_cell_data)\n", mdd6.plen, mdd6.mtu);
++		mdd6.up = mdd6.plen > 0 && mdd6.plen <= 128;
++	}
++	mdd6.step++;
++	mdd6.at = 0;
++}
++
+ /*
+  * ---- mobile data, stage B: packets on IP_HW0 (MHI 100 to the modem, 101 from it) ----
+  * Started once the session is up: both channels in burst mode on the hardware event rings 7 / 8, 15 downlink buffers
+@@ -2498,7 +2638,7 @@ mx_csum(const uint8_t *p, unsigned n)
+ 
+ /* One IP packet to the modem (QMAP mux 1); false when the uplink ring is full. */
+ static bool
+-mx_data_send(const uint8_t *ip, unsigned n)
++mx_data_send_mux(const uint8_t *ip, unsigned n, unsigned mux)
+ {
+ 	if (!mxd.started || n + 4 > MH_DA_LEN || ((mxd.out_wp + 1) % MH_DA_N) == mxd.ul_done) {
+ 		mxd.drops++;
+@@ -2507,7 +2647,7 @@ mx_data_send(const uint8_t *ip, unsigned n)
+ 	unsigned slot = mxd.out_wp;
+ 	uint8_t *b = (uint8_t *)(mx.mem + MH_DATX + slot * MH_DA_LEN);
+ 	b[0] = 0;
+-	b[1] = 1;
++	b[1] = (uint8_t)mux;
+ 	b[2] = (uint8_t)(n >> 8);
+ 	b[3] = (uint8_t)n;
+ 	memcpy(b + 4, ip, n);
+@@ -2519,6 +2659,13 @@ mx_data_send(const uint8_t *ip, unsigned n)
+ 	return true;
+ }
+ 
++/* IPv4 on mux 1 (the first session), IPv6 on mux 2 (the IPv6 session) */
++static bool
++mx_data_send(const uint8_t *ip, unsigned n)
++{
++	return mx_data_send_mux(ip, n, n > 0 && (ip[0] >> 4) == 6 ? 2 : 1);
++}
++
+ static void
+ mx_data_dl_queue(unsigned b)
+ {
+@@ -2575,7 +2722,8 @@ static struct {
+ 	mbuf_t q[PD_Q];
+ 	unsigned head, count;
+ 	uint32_t addr;                  /* the address it has (0: none) */
+-	unsigned in, out, qdrops, big;
++	bool v6;                        /* the IPv6 session's address is on it */
++	unsigned in, out, qdrops, big, na;
+ } pd;
+ 
+ static errno_t
+@@ -2800,6 +2948,86 @@ pd_input(const uint8_t *p, unsigned n)
+ 	}
+ }
+ 
++/* IPv6 on pdp_ip0: attach (as configd's SIOCPROTOATTACH_IN6), link-local, then the session's address / prefix */
++static void
++pd_configure6(void)
++{
++	socket_t so = NULL;
++	errno_t e = sock_socket(PF_INET6, SOCK_DGRAM, 0, NULL, NULL, &so), e1 = 0, e2 = 0, e3 = 0;
++	if (e == 0) {
++		struct in6_aliasreq_64 r;
++		bzero(&r, sizeof(r));
++		snprintf(r.ifra_name, sizeof(r.ifra_name), "pdp_ip0");
++		e1 = sock_ioctl(so, SIOCPROTOATTACH_IN6_64, &r);
++		bzero(&r, sizeof(r));
++		snprintf(r.ifra_name, sizeof(r.ifra_name), "pdp_ip0");
++		e2 = sock_ioctl(so, SIOCLL_START_64, &r);
++		bzero(&r, sizeof(r));
++		snprintf(r.ifra_name, sizeof(r.ifra_name), "pdp_ip0");
++		r.ifra_addr.sin6_len = sizeof(r.ifra_addr);
++		r.ifra_addr.sin6_family = AF_INET6;
++		memcpy(&r.ifra_addr.sin6_addr, mdd6.addr, 16);
++		r.ifra_prefixmask.sin6_len = sizeof(r.ifra_prefixmask);
++		r.ifra_prefixmask.sin6_family = AF_INET6;
++		for (unsigned i = 0; i < mdd6.plen && i < 128; ++i) {
++			r.ifra_prefixmask.sin6_addr.s6_addr[i / 8] |= (uint8_t)(0x80u >> (i % 8));
++		}
++		r.ifra_lifetime.ia6t_vltime = 0xffffffffu;      /* ND6_INFINITE_LIFETIME */
++		r.ifra_lifetime.ia6t_pltime = 0xffffffffu;      /* ND6_INFINITE_LIFETIME */
++		e3 = sock_ioctl(so, SIOCAIFADDR_IN6_64, &r);
++		sock_close(so);
++	}
++	pd.v6 = e == 0 && e3 == 0;
++	printf("SWEET MDM: DATA6: pdp_ip0 IPv6: attach %d, link-local %d, address /%u %d\n", e1, e2, mdd6.plen, e3);
++}
++
++/*
++ * The stack's Neighbor Solicitations on pdp_ip0 (cellular needs a neighbor cache in XNU, but nothing on the other side
++ * answers them): not sent to the modem; one with a source address is answered here with a Neighbor Advertisement for
++ * its target (router, solicited, override; no link-layer option: pdp_ip0 has no link address). DAD's (source ::) get
++ * no answer, so the address stays ours. True when the packet was one.
++ */
++static bool
++pd_ns(const uint8_t *p, unsigned n)
++{
++	if (n < 40 + 24 || (p[0] >> 4) != 6 || p[6] != 58 || p[40] != ND_NEIGHBOR_SOLICIT) {
++		return false;
++	}
++	static const uint8_t zero[16];
++	if (memcmp(p + 8, zero, 16) == 0) {
++		return true;                    /* DAD */
++	}
++	uint8_t a[40 + 24];
++	bzero(a, sizeof(a));
++	a[0] = 0x60;
++	a[5] = 24;                              /* payload length */
++	a[6] = 58;
++	a[7] = 255;
++	memcpy(a + 8, p + 48, 16);              /* from the target */
++	memcpy(a + 24, p + 8, 16);              /* to the asker */
++	a[40] = ND_NEIGHBOR_ADVERT;
++	a[44] = 0xe0;                           /* router, solicited, override */
++	memcpy(a + 48, p + 48, 16);
++	/* ICMPv6 checksum over the pseudo-header */
++	uint32_t sum = 0;
++	for (unsigned i = 8; i < 40; i += 2) {
++		sum += (uint32_t)(a[i] << 8 | a[i + 1]);
++	}
++	sum += 24 + 58;
++	for (unsigned i = 40; i < 64; i += 2) {
++		sum += (uint32_t)(a[i] << 8 | a[i + 1]);
++	}
++	while (sum >> 16) {
++		sum = (sum & 0xffff) + (sum >> 16);
++	}
++	uint16_t c = (uint16_t)~sum;
++	a[42] = (uint8_t)(c >> 8);
++	a[43] = (uint8_t)c;
++	pd.na++;
++	pd_input(a, sizeof(a));
++	return true;
++}
++
+ /* the stack's queued packets to the modem (from the modem thread) */
+ static void
+ pd_drain(void)
+@@ -2816,7 +3044,9 @@ pd_drain(void)
+ 		pd.count--;
+ 		lck_mtx_unlock(pd.lock);
+ 		size_t n = mbuf_pkthdr_len(m);
+-		if (n <= sizeof(b) - 4 && mbuf_copydata(m, 0, n, b) == 0 && mx_data_send(b, (unsigned)n)) {
++		if (n <= sizeof(b) - 4 && mbuf_copydata(m, 0, n, b) == 0 && pd_ns(b, (unsigned)n)) {
++			ifnet_stat_increment_out(pd.ifp, 1, (u_int32_t)n, 0);
++		} else if (n <= sizeof(b) - 4 && mbuf_copydata(m, 0, n, b) == 0 && mx_data_send(b, (unsigned)n)) {
+ 			pd.out++;
+ 			ifnet_stat_increment_out(pd.ifp, 1, (u_int32_t)n, 0);
+ 		} else {
+@@ -2961,6 +3191,8 @@ mx_data_start(void)
+ }
+ 
+ /* from the modem thread's loop: poll the hardware rings; the test once the session is up */
++static unsigned next, next_log;         /* mx_data_poll's status string / log times */
++
+ static void
+ mx_data_poll(unsigned t_ms)
+ {
+@@ -2983,17 +3215,23 @@ mx_data_poll(unsigned t_ms)
+ 	if (pd.addr != mdd.addr) {
+ 		pd_configure(mdd.addr);
+ 	}
++	if (pd.addr != 0 && mdd6.up && !pd.v6) {
++		pd_configure6();
++		next = 0;
++	}
+ 	pd_drain();
+ 	if (mxd.tests < 3 && t_ms >= mxd.test_at) {
+ 		mxd.test_at = t_ms + 20000;
+ 		mx_data_test();
+ 	}
+-	static unsigned next, next_log;
+ 	if (t_ms >= next) {
+ 		next = t_ms + 5000;             /* the string sweet-telephonyd reads (every 5 s); the log every 60 s */
+ 		snprintf(sweet_cell_data, sizeof(sweet_cell_data), "data=up if=%s addr=%s gw=%s mask=%s dns=%s,%s mtu=%u "
+-		    "rx=%u/%u tx=%u/%u cmds=%u drops=%u/%u answers=%u", pd.addr ? "pdp_ip0" : "-", mdd.a, mdd.g, mdd.mk, mdd.d1, mdd.d2,
+-		    mdd.mtu, mxd.rx, mxd.rx_bytes, mxd.tx, mxd.tx_bytes, mxd.cmds, mxd.drops, pd.qdrops, mxd.answers);
++		    "rx=%u/%u tx=%u/%u cmds=%u drops=%u/%u answers=%u na=%u%s%s%s%s%s%s%s%s%s%s", pd.addr ? "pdp_ip0" : "-", mdd.a, mdd.g,
++		    mdd.mk, mdd.d1, mdd.d2, mdd.mtu, mxd.rx, mxd.rx_bytes, mxd.tx, mxd.tx_bytes, mxd.cmds, mxd.drops, pd.qdrops,
++		    mxd.answers, pd.na, pd.v6 ? " addr6=" : "", pd.v6 ? mdd6.a : "", pd.v6 ? " gw6=" : "", pd.v6 ? mdd6.g : "",
++		    pd.v6 ? " dns6=" : "", pd.v6 ? mdd6.d1 : "", pd.v6 ? "," : "", pd.v6 ? mdd6.d2 : "", pd.v6 ? " plen6=" : "",
++		    pd.v6 ? mdd6.p6 : "");
+ 		if (t_ms >= next_log) {
+ 			next_log = t_ms + 60000;
+ 			printf("SWEET MDM: DATA: %s\n", sweet_cell_data);
+@@ -3155,6 +3393,7 @@ mx_qmi_survey(unsigned t_ms)
+ {
+ 	mx_mode_steer(t_ms);
+ 	mx_data_step(t_ms);
++	mx_data6_step(t_ms);
+ 	if (!mq.asked && mq.svc_port[0x02] && mq.svc_port[0x0b] && mq.svc_port[0x03]) {
+ 		mq.asked = true;
+ 		printf("SWEET MDM: QMI: DMS, UIM and NAS announced: asking\n");
+@@ -3452,6 +3691,7 @@ md_mission(void)
+ 		restarts++;
+ 		pd_configure(0);
+ 		bzero(&mdd, sizeof(mdd));
++		bzero(&mdd6, sizeof(mdd6));
+ 		bzero(&mxd, sizeof(mxd));
+ 		snprintf(sweet_cell_data, sizeof(sweet_cell_data), "data=off");
+ 		unsigned files = 0;
+-- 
+2.54.0 (Apple Git-157)
+

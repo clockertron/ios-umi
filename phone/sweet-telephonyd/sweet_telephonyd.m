@@ -172,6 +172,15 @@ notify_client(SweetCT *c, BOOL force)
 		((void (*)(id, SEL, id, id))objc_msgSend)(proxy, NSSelectorFromString(@"signalStrengthChanged:info:"), ctx, signal_info());
 		sent++;
 	}
+	/* the data SIM: without it SpringBoard never marks the line as providing data and shows no LTE / 4G */
+	if (ctx != nil && WANT("currentDataSimChanged:")) {
+		((void (*)(id, SEL, id))objc_msgSend)(proxy, NSSelectorFromString(@"currentDataSimChanged:"), ctx);
+		sent++;
+	}
+	if (ctx != nil && WANT("preferredDataSimChanged:")) {
+		((void (*)(id, SEL, id))objc_msgSend)(proxy, NSSelectorFromString(@"preferredDataSimChanged:"), ctx);
+		sent++;
+	}
 	if (ctx != nil && WANT("dataStatus:dataStatusInfo:")) {
 		((void (*)(id, SEL, id, id))objc_msgSend)(proxy, NSSelectorFromString(@"dataStatus:dataStatusInfo:"), ctx, data_status());
 		sent++;
@@ -385,7 +394,9 @@ answer_for(NSString *sel)
 		return @[ data_status(), nul ];
 	}
 	if ([sel isEqualToString:@"getUserDefaultVoiceSubscriptionContext:"] ||
-	    [sel isEqualToString:@"getUserDataPreferredSubscriptionContext:"]) {
+	    [sel isEqualToString:@"getUserDataPreferredSubscriptionContext:"] ||
+	    [sel isEqualToString:@"getCurrentDataSubscriptionContext:"] ||
+	    [sel isEqualToString:@"getPreferredDataSubscriptionContext:"]) {
 		id ctx = slot1_context();
 		return ctx ? @[ ctx, nul ] : nil;
 	}
@@ -641,12 +652,15 @@ data_publish(void)
 		}
 	}
 	BOOL up = [kv[@"data"] isEqualToString:@"up"] && [kv[@"if"] isEqualToString:@"pdp_ip0"] && kv[@"addr"] != nil;
-	NSString *now = up ? [NSString stringWithFormat:@"%@ %@ %@", kv[@"addr"], kv[@"gw"], kv[@"dns"]] : @"down";
+	BOOL up6 = up && kv[@"addr6"] != nil && kv[@"plen6"] != nil;
+	NSString *now = up ? [NSString stringWithFormat:@"%@ %@ %@ %@", kv[@"addr"], kv[@"gw"], kv[@"dns"],
+	                                                    up6 ? kv[@"addr6"] : @"-"] : @"down";
 	if ([now isEqualToString:published ?: @""]) {
 		return;
 	}
 	NSString *svc = @"State:/Network/Service/5EE7CE11-0000-4000-8000-00000000AB55";
 	NSString *k4 = [svc stringByAppendingString:@"/IPv4"], *kd = [svc stringByAppendingString:@"/DNS"];
+	NSString *k6 = [svc stringByAppendingString:@"/IPv6"];
 	Boolean ok;
 	if (up) {
 		NSDictionary *v4 = @{ @"Addresses": @[ kv[@"addr"] ], @"DestAddresses": @[ kv[@"gw"] ],
@@ -658,10 +672,23 @@ data_publish(void)
 				[dns addObject:d];
 			}
 		}
-		NSDictionary *dn = @{ @"ServerAddresses": dns, @"InterfaceName": @"pdp_ip0" };
-		ok = sc_set_multiple((CFTypeRef)store, (__bridge CFDictionaryRef) @{ k4: v4, kd: dn }, NULL, NULL);
+		NSMutableDictionary *set = [NSMutableDictionary dictionary];
+		set[k4] = v4;
+		if (up6) {
+			/* IPv6 session (kernel 0278): address / prefix on pdp_ip0, the gateway as router, its DNS too */
+			set[k6] = @{ @"Addresses": @[ kv[@"addr6"] ], @"PrefixLength": @[ @([kv[@"plen6"] intValue]) ],
+				     @"Router": kv[@"gw6"] ?: @"::", @"InterfaceName": @"pdp_ip0" };
+			for (NSString *d in [kv[@"dns6"] ?: @"" componentsSeparatedByString:@","]) {
+				if (d.length && ![d isEqualToString:@"::"]) {
+					[dns addObject:d];
+				}
+			}
+		}
+		set[kd] = @{ @"ServerAddresses": dns, @"InterfaceName": @"pdp_ip0" };
+		ok = sc_set_multiple((CFTypeRef)store, (__bridge CFDictionaryRef)set, up6 ? NULL : (__bridge CFArrayRef) @[ k6 ],
+		    NULL);
 	} else {
-		ok = sc_set_multiple((CFTypeRef)store, NULL, (__bridge CFArrayRef) @[ k4, kd ], NULL);
+		ok = sc_set_multiple((CFTypeRef)store, NULL, (__bridge CFArrayRef) @[ k4, k6, kd ], NULL);
 	}
 	say(@"data: cellular service %@ in configd: %@ (%@)", up ? @"published" : @"removed", ok ? @"ok" : @"FAILED", now);
 	if (ok) {

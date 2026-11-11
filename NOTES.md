@@ -2,6 +2,28 @@
 
 ## umi (Xiaomi Mi 10, SM8250) port - branch `umi` on qcom-toolbox/ios-sweet (2026-10-20)
 
+- **2026-11-11 20:45: STATUS BAR SHOWS "LTE"; IPv6 refused by the carrier profile** (patch
+  `xnu/patches/0278-umi-x55-ipv6.patch`; image `shim/out/umi-0278-ipv6.img`; sweet-telephonyd this commit).
+  - **LTE icon:** SystemStatusServer shows the data type only for the line it marks `providingDataConnection`, which
+    comes from the *data SIM* (`getCurrentDataSubscriptionContext(Sync)` / `currentDataSimChanged:`), then
+    `dataConnectionType` = STTelephonyDataConnectionTypeForIndicatorNameAndRadioTechnology(indicator, RAT) - its jump
+    table (SystemStatusServer `__TEXT.__const` 0x1c55cbc55): indicator 1 -> 1/2 (by RAT), 2 -> 3, 3 -> 4, 4/5 -> 5,
+    **7 -> 7 (LTE)**, 8 -> 11, 13 -> 10, 14 -> 8, 15 -> 9, 16 -> 12, 17 -> 13, 18 -> 14, others 0; LTE types 7..10
+    become 6 ("4G") if the carrier bundle's LTEConnectionShows4G. sweet-telephonyd now answers
+    getCurrentDataSubscriptionContext: / getPreferredDataSubscriptionContext: with the slot-1 context and sends
+    currentDataSimChanged: / preferredDataSimChanged: to the clients that registered (SpringBoard does): **"LTE" shown**.
+    Installed without a reboot (the daemon restarts itself on a new binary).
+  - **IPv6 (kernel 0278):** a second WDS client (QRTR port 0x4003) bound to QMAP mux 2, family 6: bind and family
+    accepted, **Start Network refused: error 14, end reason 1, verbose type 2 (internal) reason 210 = IPv6 call
+    disallowed by the PDN** - this SIM's default profile is IPv4-only. Tried 3 times at most, IPv4 unaffected. Ready
+    in the kernel for a profile that allows it: IPv6 on pdp_ip0 (SIOCPROTOATTACH_IN6, SIOCLL_START, the session's
+    address / prefix), IPv6 packets on mux 2, the stack's Neighbor Solicitations answered locally with a Neighbor
+    Advertisement (XNU wants a neighbor cache on IFT_CELLULAR; an NA with no link-layer option is accepted on an
+    interface with no link address; DAD's are not answered); kern.sweet_cell_data gains addr6 / gw6 / dns6 / plen6
+    and sweet-telephonyd publishes State:/.../IPv6 and the IPv6 DNS. Next option (not done): WDS Modify Profile to
+    IPv4v6 (modem EFS = our RAM store, nothing written to the phone).
+  - USB networking stopped once mid-boot again (0277b, 20:22): the Mac's address vanished and the gadget did not
+    come back until the next boot - an ECM gadget bug to look at.
 - **2026-11-11 20:25: 🎉 MOBILE DATA WORKS - Safari loads pages over LTE (Sunrise) with Wi-Fi off** (user: "Safari
   works"). Patch `xnu/patches/0277-umi-x55-pdp-ip0.patch` (kernel 70b0c82); image **`shim/out/umi-0277b-pdp-ip0.img`**
   (`sweetmdm=10 sweetmdmonline=1`, no ADT baseband node); sweet-telephonyd with the configd service (this commit).
