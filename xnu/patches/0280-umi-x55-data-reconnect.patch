@@ -1,0 +1,60 @@
+From 395b2f85d5a3fa3eb49cae001ecfba990b398c84 Mon Sep 17 00:00:00 2001
+From: qualcomm-toolbox <169756160+qcom-toolbox@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 21:15:29 +0100
+Subject: [PATCH] umi: X55 (0279c): WDS packet service status 'disconnected' ->
+ pdp_ip0 down, data=down, Start Network again once registered (untested: a
+ short signal loss kept the session)
+
+---
+ bsd/dev/sweet_mdm.c | 28 ++++++++++++++++++++++++++++
+ 1 file changed, 28 insertions(+)
+
+diff --git a/bsd/dev/sweet_mdm.c b/bsd/dev/sweet_mdm.c
+index 169a95a..062201d 100644
+--- a/bsd/dev/sweet_mdm.c
++++ b/bsd/dev/sweet_mdm.c
+@@ -2511,6 +2511,29 @@ mx_data_rx(uint32_t svc, unsigned msg, const uint8_t *m, uint32_t len, unsigned
+ 	if (svc == 0x01 && m[0] == 2 && mx_profile_rx(msg, m, len, res, err)) {
+ 		return true;
+ 	}
++	/*
++	 * 0279c: WDS Packet Service Status indication (0x22): TLV 1 = connection status (1 disconnected, 2 connected,
++	 * 3 suspended, 4 authenticating), reconfiguration. A session the network dropped (signal lost in the countryside)
++	 * is marked down - pdp_ip0 loses its address (mx_data_poll), sweet-telephonyd removes the service - and started
++	 * again (Start Network: the client's mux binding and family stay) once the modem is registered again.
++	 */
++	if (svc == 0x01 && m[0] == 4 && msg == 0x22) {
++		v = mx_tlv(m, len, 0x01, &tl);
++		unsigned st = v != NULL && tl >= 1 ? v[0] : 0;
++		printf("SWEET MDM: DATA: packet service status %u (1 disconnected, 2 connected)%s\n", st,
++		    st == 1 && mdd.up ? ": the session is gone, again once registered" : "");
++		if (st == 1 && mdd.up) {
++			if ((v = mx_tlv(m, len, 0x10, &tl)) != NULL && tl >= 2) {
++				printf("SWEET MDM: DATA: call end reason %u\n", v[0] | v[1] << 8);
++			}
++			mdd.up = false;
++			mdd.addr = 0;
++			mdd.step = 6;                   /* Start Network again */
++			mdd.at = 0;
++			snprintf(sweet_cell_data, sizeof(sweet_cell_data), "data=down");
++		}
++		return true;
++	}
+ 	if (!((svc == 0x1a && msg == 0x20 && want == 1) || (svc == 0x01 && msg == 0xa2 && want == 3) ||
+ 	    (svc == 0x01 && msg == 0x4d && want == 5) || (svc == 0x01 && msg == 0x20 && want == 7) ||
+ 	    (svc == 0x01 && msg == 0x2d && want == 9))) {
+@@ -3282,6 +3305,11 @@ mx_data_poll(unsigned t_ms)
+ 		mx_data_er(7, MH_ER7, MH_ER7_N, &mxd.er7_rp, &mxd.er7_wp);
+ 		mx_data_er(8, MH_ER8, MH_ER8_N, &mxd.er8_rp, &mxd.er8_wp);
+ 	}
++	if (!mdd.up && pd.addr != 0) {
++		pd_configure(0);                /* the session went (0279c): IPv6 again after the next IPv4 session */
++		pd.v6 = false;
++		bzero(&mdd6, sizeof(mdd6));
++	}
+ 	if (!mdd.up || mxd.failed) {
+ 		return;
+ 	}
+-- 
+2.54.0 (Apple Git-157)
+

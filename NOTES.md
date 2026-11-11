@@ -2,6 +2,15 @@
 
 ## umi (Xiaomi Mi 10, SM8250) port - branch `umi` on qcom-toolbox/ios-sweet (2026-10-20)
 
+- **2026-11-11 21:15: signal lost and back with data intact; reconnect handling for a dropped session (untested)**
+  (patch `xnu/patches/0280-umi-x55-data-reconnect.patch`, kernel 0279c; image `shim/out/umi-0279c-reconnect.img`).
+  - On 0279b in the countryside: registered (-86 dBm) -> "searching", then no radio at all (-128 dBm, rat none) for a
+    minute or two -> back. **The modem sent no "disconnected" for the data session: Sunrise kept it**, Safari loaded
+    again at once (user). 25 uplink packets dropped while out of coverage (ring full).
+  - 0279c: a WDS Packet Service Status indication (0x22, TLV 1 = 1 disconnected) marks the session down -
+    `kern.sweet_cell_data` "data=down", pdp_ip0 loses its address (sweet-telephonyd removes the configd service) - and
+    Start Network runs again (same client: mux binding and family stay) once registered; IPv6 retried after it. Not
+    exercised yet (needs a loss long enough for the network to drop the session).
 - **2026-11-11 21:10: network re-search; the profile was already IPv4v6 - Sunrise answers IPv4 only** (patch
   `xnu/patches/0279-umi-x55-research-ipv4v6.patch`; image **`shim/out/umi-0279b-ipv4v6.img`**).
   - In the countryside (0279) the modem saw Swisscom LTE ("searching") and Salt UMTS ("denied" - roaming not allowed
