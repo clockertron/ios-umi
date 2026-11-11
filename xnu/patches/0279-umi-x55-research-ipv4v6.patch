@@ -1,0 +1,160 @@
+From 46840d28ee2e2002afe3e437ae7e68edf6f84c90 Mon Sep 17 00:00:00 2001
+From: qualcomm-toolbox <169756160+qcom-toolbox@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 21:10:59 +0100
+Subject: [PATCH] umi: X55 (0279b): new network search after 3 min unregistered
+ (low power, online again); default profile checked / set to IPv4v6 before the
+ session (already IPv4v6 on this SIM)
+
+---
+ bsd/dev/sweet_mdm.c | 107 ++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 107 insertions(+)
+
+diff --git a/bsd/dev/sweet_mdm.c b/bsd/dev/sweet_mdm.c
+index 22f3e67..169a95a 100644
+--- a/bsd/dev/sweet_mdm.c
++++ b/bsd/dev/sweet_mdm.c
+@@ -2370,6 +2370,81 @@ mx_ip4(char *b, size_t n, uint32_t a)
+ 	snprintf(b, n, "%u.%u.%u.%u", a >> 24, (a >> 16) & 0xff, (a >> 8) & 0xff, a & 0xff);
+ }
+ 
++/*
++ * Before the session (0279): the default 3GPP profile's PDP type to IPv4v6, as real phones ask - the network grants
++ * IPv4 only where it has no IPv6 (this SIM's profile was IPv4: the IPv6 call was refused, reason 210). WDS Get Default
++ * Profile Number 0x49 -> Get Profile Settings 0x2b (PDP type TLV 0x11: 0 IPv4, 1 PPP, 2 IPv6, 3 IPv4v6) -> Modify
++ * Profile Settings 0x28 (0x11 = 3) when it is not IPv4v6. The modem keeps profiles in its EFS (our RAM store: nothing
++ * written to the phone). Any refusal: logged, the session goes on as before.
++ */
++static struct {
++	unsigned step, at;
++	uint8_t index, pdp;
++} mdp;
++
++static void
++mx_profile_step(unsigned t_ms)
++{
++	uint8_t t[16];
++	unsigned k = 0;
++	if ((mdp.step & 1) && t_ms < mdp.at) {
++		return;
++	}
++	if (mdp.step & 1) {
++		printf("SWEET MDM: PROFILE: no answer, the session goes on\n");
++		mdp.step = 6;
++		return;
++	}
++	mdp.at = t_ms + 10000;
++	switch (mdp.step) {
++	case 0:
++		t[k++] = 0x01; t[k++] = 2; t[k++] = 0; t[k++] = 0; t[k++] = 0;  /* 3GPP, embedded family */
++		mx_qmi_req(0x01, 0x49, t, (uint16_t)k);
++		break;
++	case 2:
++		t[k++] = 0x01; t[k++] = 2; t[k++] = 0; t[k++] = 0; t[k++] = mdp.index;
++		mx_qmi_req(0x01, 0x2b, t, (uint16_t)k);
++		break;
++	case 4:
++		t[k++] = 0x01; t[k++] = 2; t[k++] = 0; t[k++] = 0; t[k++] = mdp.index;
++		mx_put8(t, &k, 0x11, 3);
++		printf("SWEET MDM: PROFILE: default profile %u: PDP type %u -> 3 (IPv4v6)\n", mdp.index, mdp.pdp);
++		mx_qmi_req(0x01, 0x28, t, (uint16_t)k);
++		break;
++	default:
++		return;
++	}
++	mdp.step++;
++}
++
++/* the profile requests' answers; true when the message was one */
++static bool
++mx_profile_rx(unsigned msg, const uint8_t *m, uint32_t len, unsigned res, unsigned err)
++{
++	uint16_t tl = 0;
++	const uint8_t *v;
++	if (!((msg == 0x49 && mdp.step == 1) || (msg == 0x2b && mdp.step == 3) || (msg == 0x28 && mdp.step == 5))) {
++		return false;
++	}
++	printf("SWEET MDM: PROFILE: WDS %#x -> result %u error %u\n", msg, res, err);
++	if (res != 0) {
++		mdp.step = 6;
++		return true;
++	}
++	if (msg == 0x49) {
++		mdp.index = (v = mx_tlv(m, len, 0x01, &tl)) != NULL && tl >= 1 ? v[0] : 1;
++		mdp.step = 2;
++	} else if (msg == 0x2b) {
++		mdp.pdp = (v = mx_tlv(m, len, 0x11, &tl)) != NULL && tl >= 1 ? v[0] : 0xff;
++		printf("SWEET MDM: PROFILE: default profile %u has PDP type %u (0 IPv4, 2 IPv6, 3 IPv4v6)\n", mdp.index, mdp.pdp);
++		mdp.step = mdp.pdp == 3 ? 6 : 4;
++	} else {
++		mdp.step = 6;
++	}
++	mdp.at = 0;
++	return true;
++}
++
+ static void
+ mx_data_step(unsigned t_ms)
+ {
+@@ -2379,6 +2454,10 @@ mx_data_step(unsigned t_ms)
+ 	    t_ms < mdd.at) {
+ 		return;
+ 	}
++	if (mdp.step < 6) {
++		mx_profile_step(t_ms);
++		return;
++	}
+ 	uint8_t t[96];
+ 	unsigned k = 0;
+ 	mdd.at = t_ms + 30000;          /* an answer that never comes: the step again in 30 s */
+@@ -2429,6 +2508,9 @@ mx_data_rx(uint32_t svc, unsigned msg, const uint8_t *m, uint32_t len, unsigned
+ 	uint16_t tl = 0;
+ 	const uint8_t *v;
+ 	unsigned want = mdd.step;
++	if (svc == 0x01 && m[0] == 2 && mx_profile_rx(msg, m, len, res, err)) {
++		return true;
++	}
+ 	if (!((svc == 0x1a && msg == 0x20 && want == 1) || (svc == 0x01 && msg == 0xa2 && want == 3) ||
+ 	    (svc == 0x01 && msg == 0x4d && want == 5) || (svc == 0x01 && msg == 0x20 && want == 7) ||
+ 	    (svc == 0x01 && msg == 0x2d && want == 9))) {
+@@ -3378,6 +3460,30 @@ mx_mode_steer(unsigned t_ms)
+ 		mx_qmi_req(0x02, 0x2e, lpm, 4);
+ 		return;
+ 	}
++	/*
++	 * 0279b: online but not registered for 3 minutes -> low power and online again 5 s later, as a phone's airplane
++	 * mode toggle: a fresh network search (in the countryside the modem stayed on another operator's 3G cell,
++	 * "denied", and never went back to look for the home network).
++	 */
++	static unsigned unreg_since, researches;
++	if (mq.opmode == 0 && mq.reg != 1) {
++		if (unreg_since == 0) {
++			unreg_since = t_ms ? t_ms : 1;
++		} else if (t_ms - unreg_since >= 180000) {
++			static const uint8_t lpm2[4] = { 0x01, 0x01, 0x00, 0x01 };
++			unreg_since = 0;
++			researches++;
++			mq.online_at = t_ms + 5000;
++			mq.next_online = 0;
++			printf("SWEET MDM: QMI: not registered for 3 min: LOW POWER, online again in 5 s (new network search %u)\n",
++			    researches);
++			mx_qmi_req(0x02, 0x2e, lpm2, 4);
++			mx_qmi_req(0x02, 0x2d, NULL, 0);
++			return;
++		}
++	} else {
++		unreg_since = 0;
++	}
+ 	if (t_ms >= mq.online_at && t_ms >= mq.next_online && mq.opmode != 0) {
+ 		mq.next_online = t_ms + 10000;
+ 		static const uint8_t on[4] = { 0x01, 0x01, 0x00, 0x00 };     /* TLV 1: mode 0 = online */
+@@ -3692,6 +3798,7 @@ md_mission(void)
+ 		pd_configure(0);
+ 		bzero(&mdd, sizeof(mdd));
+ 		bzero(&mdd6, sizeof(mdd6));
++		bzero(&mdp, sizeof(mdp));
+ 		bzero(&mxd, sizeof(mxd));
+ 		snprintf(sweet_cell_data, sizeof(sweet_cell_data), "data=off");
+ 		unsigned files = 0;
+-- 
+2.54.0 (Apple Git-157)
+

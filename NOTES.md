@@ -2,6 +2,18 @@
 
 ## umi (Xiaomi Mi 10, SM8250) port - branch `umi` on qcom-toolbox/ios-sweet (2026-10-20)
 
+- **2026-11-11 21:10: network re-search; the profile was already IPv4v6 - Sunrise answers IPv4 only** (patch
+  `xnu/patches/0279-umi-x55-research-ipv4v6.patch`; image **`shim/out/umi-0279b-ipv4v6.img`**).
+  - In the countryside (0279) the modem saw Swisscom LTE ("searching") and Salt UMTS ("denied" - roaming not allowed
+    for this SIM) and **stayed there**, never looking for Sunrise again (earlier boots, same place: registered in ~2
+    min). Fix (0279b): online but not registered for 3 minutes -> DMS low power, online again 5 s later (a phone's
+    airplane-mode toggle: a fresh network search), repeated every 3 minutes. 0279b: one re-search, then registered on
+    Sunrise, data up.
+  - Before the session the kernel now reads the default 3GPP profile (WDS 0x49 -> 0x2b) and sets its PDP type to
+    IPv4v6 (0x28) if it is not: **it already was IPv4v6 (type 3)**. So the IPv6 refusal (reason 210 "IPv6 call
+    disallowed") is the network granting a single IPv4 bearer to a dual-stack request: **Sunrise has no IPv6 on this
+    plan** (user: "sunrise does not support ipv6"). Nothing to change.
+  - Fastboot once failed to take the image (`usb_read failed e00002ed`, also for getvar) until a re-plug.
 - **2026-11-11 20:45: STATUS BAR SHOWS "LTE"; IPv6 refused by the carrier profile** (patch
   `xnu/patches/0278-umi-x55-ipv6.patch`; image `shim/out/umi-0278-ipv6.img`; sweet-telephonyd this commit).
   - **LTE icon:** SystemStatusServer shows the data type only for the line it marks `providingDataConnection`, which
