@@ -1,0 +1,1177 @@
+From d67c463365e0341922168b7320554b070af76f17 Mon Sep 17 00:00:00 2001
+From: qualcomm-toolbox <169756160+qcom-toolbox@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 22:54:41 +0100
+Subject: [PATCH] umi: GPU (0282): a hung 3D core is reset and goes on
+ (watchdog, SW reset, pending submissions dropped); SMMU faults logged +
+ cleared, no longer 'device lost' for every client; submit walk visits each
+ page once (8 -> 2 ms per submit); only changed page tables flushed per
+ map/unmap; page-table slots 8192 + window reuse (0253, was uncommitted);
+ frame-time and submit-part lines; A650 clock gating opt-in (sweetgpuhwcg=1,
+ untested)
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ bsd/dev/sweet_adreno.c                | 596 ++++++++++++++++++++++----
+ iokit/Kernel/arm/SweetAdreno.cpp      |  78 +++-
+ iokit/Kernel/arm/SweetFramebuffer.cpp |  35 ++
+ 3 files changed, 614 insertions(+), 95 deletions(-)
+
+diff --git a/bsd/dev/sweet_adreno.c b/bsd/dev/sweet_adreno.c
+index 96c6491..16a5969 100644
+--- a/bsd/dev/sweet_adreno.c
++++ b/bsd/dev/sweet_adreno.c
+@@ -102,6 +102,7 @@ void sweet_adreno_init(void);
+ 
+ static uint32_t sa_steps, sa_step, sa_pause_ms = 2200;
+ static bool sa_started;
++static bool sa_quiet;           /* (0282) recovery re-runs step 20's register writes: no line per register, no undo */
+ 
+ static void
+ sa_sleep_ms(uint32_t ms)
+@@ -143,6 +144,9 @@ sa_need(struct sa_block *b)
+ static void
+ sa_announce(const char *what)
+ {
++	if (sa_quiet) {
++		return;
++	}
+ 	printf("SWEET GPU: step %u: %s\n", sa_step, what);
+ 	if (sa_step == sa_steps && sa_pause_ms) {
+ 		sa_sleep_ms(sa_pause_ms);
+@@ -154,7 +158,9 @@ sa_get(struct sa_block *b, const char *name, uint32_t offset)
+ {
+ 	sa_need(b);
+ 	uint32_t value = sa_rd(b->base + offset);
+-	printf("SWEET GPU: %u: %s %s (%#x) = %#x\n", sa_step, b->name, name, b->phys + offset, value);
++	if (!sa_quiet) {
++		printf("SWEET GPU: %u: %s %s (%#x) = %#x\n", sa_step, b->name, name, b->phys + offset, value);
++	}
+ 	return value;
+ }
+ 
+@@ -185,6 +191,10 @@ static void
+ sa_put(struct sa_block *b, const char *name, uint32_t offset, uint32_t value)
+ {
+ 	sa_need(b);
++	if (sa_quiet) {
++		sa_wr(b->base + offset, value);
++		return;
++	}
+ 	uint32_t was = sa_rd(b->base + offset);
+ 	if (sa_undo_count < SA_UNDO_MAX) {
+ 		sa_undo[sa_undo_count].b = b;
+@@ -969,7 +979,7 @@ sa_zap_release(void)
+ #define PTE_NOT_GLOBAL          (1ull << 11)
+ #define PTE_ADDRESS             0x0000fffffffff000ull
+ #define PTE_GMU                 (PTE_SHARED | PTE_ACCESSED | PTE_NOT_GLOBAL)    /* privileged, uncached (MAIR 0) */
+-#define SA_TABLES_MAX           1024
++#define SA_TABLES_MAX           8192            /* (0253) was 1024 (< 2 GB of 2 MB L3 ranges across all windows) */
+ 
+ static uint64_t
+ sa_phys(vm_offset_t va)
+@@ -1005,16 +1015,67 @@ struct sa_space {
+ 	uint64_t table_phys[SA_TABLES_MAX];
+ };
+ 
++/*
++ * (0282) Two costs of every BoMap / BoFree and of every page the submit walk visits:
++ *  - finding a table from the physical address in its parent's entry was a linear search over all tables
++ *    (300-400 once a few processes use Metal), twice per 4 KB page: now a small direct-mapped cache in front;
++ *  - sa_core_tlb_flush cleaned EVERY table page out of the CPU cache (1.4 MB at 340 tables) for each map and
++ *    unmap: now only the tables written since the last flush (sa_dirty), all of them only if the list overflowed.
++ */
++#define SA_TCACHE               4096
++static struct {
++	uint64_t phys;
++	uint64_t *table;
++} sa_tcache[SA_TCACHE];
++#define SA_DIRTY_MAX            256
++static uint64_t *sa_dirty[SA_DIRTY_MAX];
++static uint32_t sa_dirty_count;
++static bool sa_dirty_all;
++
++static void
++sa_table_dirty(uint64_t *entry)
++{
++	uint64_t *table = (uint64_t *)((uintptr_t)entry & ~(uintptr_t)4095);
++	if (sa_dirty_count != 0 && sa_dirty[sa_dirty_count - 1] == table) {
++		return;
++	}
++	if (sa_dirty_count == SA_DIRTY_MAX) {
++		sa_dirty_all = true;
++		return;
++	}
++	sa_dirty[sa_dirty_count++] = table;
++}
++
++static uint64_t *
++sa_space_table_at(struct sa_space *space, uint64_t phys)
++{
++	uint32_t slot = (uint32_t)(phys >> 12) & (SA_TCACHE - 1);
++	if (sa_tcache[slot].phys == phys && sa_tcache[slot].table != NULL) {
++		return sa_tcache[slot].table;
++	}
++	for (uint32_t i = 0; i < space->table_count; i++) {
++		if (space->table_phys[i] == phys) {
++			sa_tcache[slot].table = space->table[i];
++			sa_tcache[slot].phys = phys;
++			return space->table[i];
++		}
++	}
++	return NULL;
++}
++
+ static uint64_t *
+ sa_space_table(struct sa_space *space)
+ {
+ 	static vm_offset_t spare;
+ 	static unsigned spare_left;
+ 	if (space->table_count == SA_TABLES_MAX) {
++		printf("SWEET ADRENO: %s has no more page-table slots (%u)\n", space->name, (unsigned)SA_TABLES_MAX);
+ 		return NULL;
+ 	}
+ 	if (spare_left == 0) {
+ 		if ((spare = sa_alloc(PAGE_SIZE)) == 0) {
++			printf("SWEET ADRENO: %s cannot allocate a page-table page (at %u tables)\n", space->name,
++			    space->table_count);
+ 			return NULL;
+ 		}
+ 		spare_left = PAGE_SIZE / 4096;
+@@ -1029,20 +1090,34 @@ static uint64_t *
+ sa_space_next(struct sa_space *space, uint64_t *entry)
+ {
+ 	if (*entry & 1) {
+-		for (uint32_t i = 0; i < space->table_count; i++) {
+-			if (space->table_phys[i] == (*entry & PTE_ADDRESS)) {
+-				return space->table[i];
+-			}
+-		}
+-		return NULL;
++		return sa_space_table_at(space, *entry & PTE_ADDRESS);
+ 	}
+ 	uint64_t *table = sa_space_table(space);
+ 	if (table != NULL) {
+ 		*entry = sa_phys((vm_offset_t)table) | PTE_TABLE;
++		sa_table_dirty(table);          /* its zeroes must be in memory before the SMMU can walk into it */
++		sa_table_dirty(entry);
+ 	}
+ 	return table;
+ }
+ 
++/* The last-level entry for `address` if its tables exist: nothing is made (unmaps, lookups). */
++static uint64_t *
++sa_space_find(struct sa_space *space, uint64_t address)
++{
++	if (address >> 39 || space->table_count == 0) {
++		return NULL;
++	}
++	uint64_t *table = space->table[0];
++	for (int shift = 30; shift > 12; shift -= 9) {
++		uint64_t entry = table[address >> shift & 0x1ff];
++		if ((entry & 3) != PTE_TABLE || (table = sa_space_table_at(space, entry & PTE_ADDRESS)) == NULL) {
++			return NULL;
++		}
++	}
++	return &table[address >> 12 & 0x1ff];
++}
++
+ /* The last-level entry for `address` (its tables made when missing), or NULL. */
+ static uint64_t *
+ sa_space_pte(struct sa_space *space, uint64_t address)
+@@ -1063,6 +1138,7 @@ sa_space_map(struct sa_space *space, uint64_t address, uint64_t phys, uint64_t a
+ 		return false;
+ 	}
+ 	*pte = phys | attributes | PTE_PAGE;
++	sa_table_dirty(pte);
+ 	return true;
+ }
+ 
+@@ -2106,17 +2182,64 @@ static const uint32_t sa_a650_protect[SA_A650_PROTECT_COUNT] = {
+ 	SA_PROTECT_NORDWR(0x1f8c0, 0x0000),     /* to the end of the register space */
+ };
+ 
+-static bool
+-sa_step_core_start(void)
++/*
++ * (0282) Hardware clock gating, as Linux a6xx_set_hwcg does for the A650 (a6xx_catalog.c a650_hwcg, register
++ * offsets from a6xx.xml; the three GMU CGC registers are left alone). Without it every block of the core is
++ * clocked all the time. Opt-in for now: sweetgpuhwcg=1.
++ */
++#define GMU_GX_SPTPRAC_CLOCK_CONTROL GMU_WORD(0x0080)   /* a6xx_gmu.xml 0x1a880 */
++#define RBBM_CLOCK_CNTL_ON_A650 0x8aa8aa82u
++static const struct {
++	uint16_t reg;
++	uint32_t value;
++} sa_a650_hwcg[] = {
++	{ 0x00b0, 0x02222222 }, { 0x00b4, 0x02222220 }, { 0x00b8, 0x00000080 }, { 0x00bc, 0x0000f3cf },   /* SP0 */
++	{ 0x00c0, 0x02222222 }, { 0x00c4, 0x22222222 }, { 0x00c8, 0x22222222 }, { 0x00cc, 0x00022222 },   /* TP0 */
++	{ 0x00d0, 0x11111111 }, { 0x00d4, 0x11111111 }, { 0x00d8, 0x11111111 }, { 0x00dc, 0x00011111 },
++	{ 0x00e0, 0x77777777 }, { 0x00e4, 0x77777777 }, { 0x00e8, 0x77777777 }, { 0x00ec, 0x00077777 },
++	{ 0x00f0, 0x22222222 }, { 0x00f4, 0x01002222 }, { 0x00f8, 0x00002220 }, { 0x0100, 0x00040f00 },   /* RB0, CCU0 */
++	{ 0x0104, 0x25222022 }, { 0x0105, 0x00005555 }, { 0x0106, 0x00000011 }, { 0x0107, 0x00445044 },   /* RAC */
++	{ 0x0108, 0x04222222 }, { 0x0111, 0x00002222 }, { 0x0114, 0x00222222 }, { 0x0117, 0x00000002 },
++	{ 0x011b, 0x00002222 }, { 0x0109, 0x00004000 }, { 0x0112, 0x00002222 }, { 0x0115, 0x00000200 },
++	{ 0x011c, 0x00000000 }, { 0x010a, 0x00000000 }, { 0x0113, 0x00000000 }, { 0x0116, 0x04104004 },
++	{ 0x011d, 0x00000000 }, { 0x0120, 0x00000222 }, { 0x0121, 0x00000111 }, { 0x0122, 0x00000777 },   /* TEX_FCHE */
++	{ 0x010b, 0x22222222 }, { 0x0110, 0x00000004 }, { 0x010f, 0x00000002 }, { 0x0533, 0x00000182 },   /* UCHE, ISDB_CNT */
++	{ 0x0044, 0x00000000 }, { 0x0042, 0x00000000 }, { 0x0118, 0x00000222 }, { 0x0119, 0x00000111 },
++	{ 0x011a, 0x00000555 },
++};
++static uint32_t sa_hwcg_want = ~0u;
++
++static void
++sa_core_hwcg(void)
++{
++	if (sa_hwcg_want == ~0u) {
++		sa_hwcg_want = 0;
++		(void)PE_parse_boot_argn("sweetgpuhwcg", &sa_hwcg_want, sizeof(sa_hwcg_want));
++	}
++	if (!sa_hwcg_want || sa_rd(sa_gpu.base + RBBM_CLOCK_CNTL) == RBBM_CLOCK_CNTL_ON_A650) {
++		return;
++	}
++	sa_need(&sa_gmu);
++	uint32_t sp = sa_rd(sa_gmu.base + GMU_GX_SPTPRAC_CLOCK_CONTROL);
++	sa_wr(sa_gmu.base + GMU_GX_SPTPRAC_CLOCK_CONTROL, sp & ~1u);          /* SP clock off while its gating is set */
++	for (unsigned i = 0; i < sizeof(sa_a650_hwcg) / sizeof(sa_a650_hwcg[0]); i++) {
++		sa_wr(sa_gpu.base + GPU_WORD(sa_a650_hwcg[i].reg), sa_a650_hwcg[i].value);
++	}
++	sa_wr(sa_gmu.base + GMU_GX_SPTPRAC_CLOCK_CONTROL, (sp & ~1u) | 1u);
++	sa_wr(sa_gpu.base + RBBM_CLOCK_CNTL, RBBM_CLOCK_CNTL_ON_A650);
++	printf("SWEET GPU: hardware clock gating on (sweetgpuhwcg=1): rbbm_clock_cntl %#x, sptprac clock control %#x -> %#x\n",
++	    sa_rd(sa_gpu.base + RBBM_CLOCK_CNTL), sp, sa_rd(sa_gmu.base + GMU_GX_SPTPRAC_CLOCK_CONTROL));
++}
++
++/* Step 20's register writes; run again by the recovery after a reset of the core (0282, then with sa_quiet). */
++static void
++sa_core_registers(void)
+ {
+ 	/* CP, VSC, GRAS, RB, PC, HLSQ, VFD, VPC, UCHE, SP, TPL1, RBBM_SECVID_TSB */
+ 	static const uint32_t address_modes[12] = { 0x0842, 0x0c01, 0x8601, 0x8e05, 0x9e01, 0xbe05, 0xa601, 0x9601, 0x0e00,
+ 		                                    0xae01, 0xb601, 0xf810 };
+ 	static const uint32_t bicubic[5] = { 0, 0x3fe05ff4, 0x3fa0ebee, 0x3f5193ed, 0x3f0243f0 };
+ 
+-	if (!sa_cx_ready() || !sa_core_space_on) {
+-		return false;
+-	}
+ 	sa_announce("write the 3D core's registers as Linux hw_init does for the A650 (no clock gating or interrupts)");
+ 	sa_put(&sa_gbif, "halt", GBIF_HALT, 0);
+ 	sa_put(&sa_gpu, "rbbm_gbif_halt", RBBM_GBIF_HALT, 0);
+@@ -2177,6 +2300,16 @@ sa_step_core_start(void)
+ 	sa_get(&sa_gpu, "cp_protect first", CP_PROTECT);
+ 	sa_get(&sa_gpu, "cp_protect untouched", CP_PROTECT + 4 * 40);
+ 	sa_get(&sa_gpu, "cp_protect last", CP_PROTECT + 4 * SA_A650_PROTECT_LAST);
++	sa_core_hwcg();
++}
++
++static bool
++sa_step_core_start(void)
++{
++	if (!sa_cx_ready() || !sa_core_space_on) {
++		return false;
++	}
++	sa_core_registers();
+ 
+ 	sa_announce("start the 3D core's command processor (cp_sqe_cntl 1)");
+ 	sa_core_runs = true;
+@@ -2490,9 +2623,17 @@ static uint32_t sa_submit_next;
+ static bool
+ sa_core_tlb_flush(void)
+ {
+-	for (uint32_t i = 0; i < sa_core_space.table_count; i++) {
+-		flush_dcache64((addr64_t)(vm_offset_t)sa_core_space.table[i], 4096, FALSE);
++	if (sa_dirty_all) {
++		for (uint32_t i = 0; i < sa_core_space.table_count; i++) {
++			flush_dcache64((addr64_t)(vm_offset_t)sa_core_space.table[i], 4096, FALSE);
++		}
++	} else {
++		for (uint32_t i = 0; i < sa_dirty_count; i++) {
++			flush_dcache64((addr64_t)(vm_offset_t)sa_dirty[i], 4096, FALSE);
++		}
+ 	}
++	sa_dirty_count = 0;
++	sa_dirty_all = false;
+ 	sa_wr(sa_smmu_cb0.base + SMMU_CB_TLBIASID, CORE_CONTEXT);
+ 	sa_wr(sa_smmu_cb0.base + SMMU_CB_TLBSYNC, 1);
+ 	return sa_wait_for(&sa_smmu_cb0, SMMU_CB_TLBSTATUS, 1, 0, 100);
+@@ -2521,9 +2662,10 @@ static bool
+ sa_bo_free(struct sa_bo *bo)
+ {
+ 	for (vm_size_t at = 0; at < bo->size; at += 4096) {
+-		uint64_t *pte = sa_space_pte(&sa_core_space, bo->gpu + at);
++		uint64_t *pte = sa_space_find(&sa_core_space, bo->gpu + at);
+ 		if (pte != NULL) {
+ 			*pte = 0;
++			sa_table_dirty(pte);
+ 		}
+ 	}
+ 	bool flushed = sa_core_tlb_flush();
+@@ -2598,6 +2740,14 @@ static struct {
+ static uint32_t sa_coh_logged;
+ static uint64_t sa_coh_moved, sa_coh_moved_last;
+ 
++/* (0282) the hang watchdog and recovery, further down */
++static uint32_t sa_recoveries, sa_recover_failures, sa_recover_dropped, sa_smmu_faults;
++static bool sa_core_dead;       /* a reset that did not bring the command processor back */
++static bool sa_watchdog_on;
++static bool sa_smmu_fault_take(const char *when);
++/* (0282) where a submit's kernel time goes: [0] the walk, [1] waiting for the lock and ring room, [2] the ring */
++uint64_t sweet_adreno_submit_abs[3];
++
+ static void
+ sa_irq(uint32_t intid)
+ {
+@@ -2720,6 +2870,10 @@ sweet_adreno_top(uint32_t secs)
+ 	    sa_stat.slept - sa_stat_last.slept, ns / NSEC_PER_MSEC, sa_stat.sleeps - sa_stat_last.sleeps,
+ 	    sa_stat.irqs - sa_stat_last.irqs, sa_irq_on ? "on" : "off");
+ 	sa_stat_last = sa_stat;
++	if (sa_recoveries != 0 || sa_smmu_faults != 0) {
++		printf("SWEET ADRENO: since boot: %u SMMU faults, %u hang recoveries (%u failed), %u submissions dropped%s\n",
++		    sa_smmu_faults, sa_recoveries, sa_recover_failures, sa_recover_dropped, sa_core_dead ? "; THE CORE IS DEAD" : "");
++	}
+ 	if (sa_fin.quiet + sa_fin.spent + sa_fin.timeouts != sa_fin_last.quiet + sa_fin_last.spent + sa_fin_last.timeouts) {
+ 		printf("SWEET ADRENO: presents waited: %llu quiet, %llu budget spent, %llu timed out\n",
+ 		    sa_fin.quiet - sa_fin_last.quiet, sa_fin.spent - sa_fin_last.spent, sa_fin.timeouts - sa_fin_last.timeouts);
+@@ -2966,9 +3120,10 @@ sweet_adreno_bo_new(vm_size_t size, uint64_t *handle, uint64_t *gpu, vm_offset_t
+ 	}
+ 	if (err != 0) {
+ 		for (vm_size_t at = 0; at < size; at += 4096) {
+-			uint64_t *pte = sa_space_pte(&sa_core_space, bo->gpu + at);
++			uint64_t *pte = sa_space_find(&sa_core_space, bo->gpu + at);
+ 			if (pte != NULL) {
+ 				*pte = 0;
++				sa_table_dirty(pte);
+ 			}
+ 		}
+ 		(void)sa_core_tlb_flush();
+@@ -3017,9 +3172,10 @@ sweet_adreno_bo_free(uint64_t handle)
+ 	int err = bo == NULL ? ENOENT : 0;
+ 	if (err == 0) {
+ 		for (vm_size_t at = 0; at < bo->size; at += 4096) {
+-			uint64_t *pte = sa_space_pte(&sa_core_space, bo->gpu + at);
++			uint64_t *pte = sa_space_find(&sa_core_space, bo->gpu + at);
+ 			if (pte != NULL) {
+ 				*pte = 0;
++				sa_table_dirty(pte);
+ 			}
+ 		}
+ 		err = sa_core_tlb_flush() ? 0 : EIO;
+@@ -3155,21 +3311,24 @@ sweet_adreno_window_alloc(task_t task, uint64_t *base, uint64_t *size)
+ 		}
+ 	}
+ 	if (i == sa_window_count) {
+-		if (sa_window_count < SA_WINDOW_MAX) {
+-			sa_window_task[i].base = sa_window_next;
+-			sa_window_next += SA_WINDOW_SIZE;
+-			sa_window_count++;
+-		} else {
+-			for (i = 0; i < sa_window_count; i++) {
+-				if (sa_window_task[i].users == 0 &&
+-				    sa_window_process_gone(sa_window_task[i].pid, sa_window_task[i].uniqueid)) {
+-					sa_window_reused++;
+-					printf("SWEET ADRENO: GPU window %#llx of exited pid %d goes to pid %d (%u reused)\n",
+-					    sa_window_task[i].base, sa_window_task[i].pid, pid, sa_window_reused);
+-					break;
+-				}
++		/* (0253) Reuse an exited process's window before handing out a fresh 4 GB span: the old window
++		 * already has its L2/L3 page tables in sa_core_space, whereas a fresh window allocates new L3
++		 * tables for every 2 MB range (which exhausted SA_TABLES_MAX = 1024 when WebKit.GPU opened). */
++		for (i = 0; i < sa_window_count; i++) {
++			if (sa_window_task[i].users == 0 &&
++			    sa_window_process_gone(sa_window_task[i].pid, sa_window_task[i].uniqueid)) {
++				sa_window_reused++;
++				printf("SWEET ADRENO: GPU window %#llx of exited pid %d goes to pid %d (%u reused)\n",
++				    sa_window_task[i].base, sa_window_task[i].pid, pid, sa_window_reused);
++				break;
+ 			}
+-			if (i == sa_window_count) {
++		}
++		if (i == sa_window_count) {
++			if (sa_window_count < SA_WINDOW_MAX) {
++				sa_window_task[i].base = sa_window_next;
++				sa_window_next += SA_WINDOW_SIZE;
++				sa_window_count++;
++			} else {
+ 				printf("SWEET ADRENO: no GPU window for pid %d: all %u in use\n", pid, (unsigned)SA_WINDOW_MAX);
+ 				err = ENOMEM;
+ 			}
+@@ -3203,6 +3362,16 @@ sweet_adreno_window_free(uint64_t base)
+ 	sa_service_drop_lock();
+ }
+ 
++uint32_t sweet_adreno_tables(uint32_t *max_tables);
++uint32_t
++sweet_adreno_tables(uint32_t *max_tables)
++{
++	if (max_tables != NULL) {
++		*max_tables = SA_TABLES_MAX;
++	}
++	return sa_core_space.table_count;
++}
++
+ extern void IOLog(const char *, ...);
+ 
+ /* Every map and unmap of context 0 (0199): which call wrote a GPU address, with what page, from
+@@ -3260,7 +3429,7 @@ sweet_adreno_map_at(uint64_t iova, const uint64_t *pages, uint32_t n)
+ 	 * its BoMap silently replace the first one's pages (a command buffer then called into
+ 	 * another device's image - the CP_OPCODE_ERROR hangs, 0194). Refused, nothing touched. */
+ 	for (uint32_t i = 0; i < n; i++) {
+-		uint64_t *pte = sa_space_pte(&sa_core_space, iova + 4096ull * i);
++		uint64_t *pte = sa_space_find(&sa_core_space, iova + 4096ull * i);
+ 		if (pte != NULL && (*pte & 3) == PTE_PAGE) {
+ 			static uint32_t told;
+ 			if (told++ < 16) {
+@@ -3292,9 +3461,10 @@ sweet_adreno_map_at(uint64_t iova, const uint64_t *pages, uint32_t n)
+ 	}
+ 	if (err != 0) {
+ 		for (uint32_t i = 0; i < n; i++) {
+-			uint64_t *pte = sa_space_pte(&sa_core_space, iova + 4096ull * i);
++			uint64_t *pte = sa_space_find(&sa_core_space, iova + 4096ull * i);
+ 			if (pte != NULL) {
+ 				*pte = 0;
++				sa_table_dirty(pte);
+ 			}
+ 		}
+ 	}
+@@ -3336,16 +3506,31 @@ sweet_adreno_unmap_at(uint64_t iova, uint64_t len)
+ 	f->done = sa_fence_read();
+ 	sa_maplog_add(iova, len, 0);
+ 	for (uint64_t at = 0; at < len; at += 4096) {
+-		uint64_t *pte = sa_space_pte(&sa_core_space, iova + at);
++		uint64_t *pte = sa_space_find(&sa_core_space, iova + at);
+ 		if (pte != NULL) {
+ 			*pte = 0;
++			sa_table_dirty(pte);
+ 		}
+ 	}
+ 	(void)sa_core_tlb_flush();
+ 	sa_service_drop_lock();
+ }
+ 
+-static void sa_ib_check(uint32_t seqno, uint32_t index, uint64_t start, uint32_t dwords);
++/*
++ * (0282) The pages one submit's walk has visited. The walk made a fresh one-page cache for every indirect buffer
++ * it followed and every draw-state group (hundreds per frame, most in the same few pages), so one page was
++ * translated, cleaned+invalidated and read back cold hundreds of times per submit: 7-8 ms of kernel time per
++ * submit, 95 % of the whole submit call (umi-0282t: "walk 761" of "submit 100/781" ms). Now each page is
++ * visited once per submit. sweetgpuwalk=0 = the old behaviour (if the frames need the walk's time after all).
++ */
++#define SA_WALK_PAGES 128
++struct sa_walk_pages {
++	uint64_t page[SA_WALK_PAGES];   /* 0: empty (GPU address 0 is never a client's) */
++	vm_offset_t kva[SA_WALK_PAGES];
++};
++uint64_t sweet_adreno_walk_pages;       /* pages translated + cleaned by the walk, for the 10 s line */
++
++static void sa_ib_check(uint32_t seqno, uint32_t index, uint64_t start, uint32_t dwords, struct sa_walk_pages *seen);
+ 
+ /* sweetgpucheck: 1 (default) the per-submit walk, 0 none, N >= 2 no walk but N ms of sleep before the doorbell -
+  * the 0242 test of whether the walk only helps by its delay (boot line full: no new boot-arg). Tested (0242d,
+@@ -3402,9 +3587,22 @@ sweet_adreno_submit_v2(const uint64_t *iova, const uint32_t *dwords, uint32_t n,
+ 		*busy = false;
+ 		return 0;
+ 	}
++	uint64_t t0 = mach_absolute_time();
++	static int walk_once = -1;
++	if (walk_once < 0) {
++		uint32_t v = 1;
++		(void)PE_parse_boot_argn("sweetgpuwalk", &v, sizeof(v));
++		walk_once = v != 0;
++	}
++	struct sa_walk_pages seen;
++	if (walk_once) {
++		bzero(seen.page, sizeof(seen.page));
++	}
+ 	for (uint32_t i = 0; i < n; i++) {
+-		sa_ib_check(sa_fence_seqno + 1, i, iova[i], dwords[i]);   /* before the lock: it reads through it */
++		/* before the lock: it reads through it */
++		sa_ib_check(sa_fence_seqno + 1, i, iova[i], dwords[i], walk_once ? &seen : NULL);
+ 	}
++	uint64_t t1 = mach_absolute_time();
+ 	sa_drain_all_cores();
+ 	if (sa_check_mode() >= 2) {
+ 		delay_for_interval(sa_check_mode(), NSEC_PER_MSEC);
+@@ -3429,6 +3627,7 @@ sweet_adreno_submit_v2(const uint64_t *iova, const uint32_t *dwords, uint32_t n,
+ 		}
+ 		delay_for_interval(100, NSEC_PER_USEC);
+ 	}
++	uint64_t t2 = mach_absolute_time();
+ 	uint32_t seqno = ++sa_fence_seqno;
+ 	/* CP_INTERRUPT_STATUS is never cleared here: log each change with the submission it was
+ 	 * seen at, so a bit in a hang dump can be dated (0193: the opcode bit may be stale) */
+@@ -3482,9 +3681,13 @@ sweet_adreno_submit_v2(const uint64_t *iova, const uint32_t *dwords, uint32_t n,
+ 	sa_ring(0);
+ 	sa_ring(seqno);
+ 	sa_ring_send();
+-	if (sa_space_faulted(&sa_smmu_cb0, "the 3D core") || sa_rd(sa_gpu.base + CP_HW_FAULT) != 0) {
+-		sa_faults++;
+-	}
++	/* (0282) a fault is logged and cleared here; whether the core got over it is the watchdog's to see. It is no
++	 * longer counted in sa_faults: the status was never cleared, so after one fault every submit counted one
++	 * and every client's GetStatus said "faulted" = VK_ERROR_DEVICE_LOST in Turnip, for all processes. */
++	(void)sa_smmu_fault_take("seen at a submit");
++	sweet_adreno_submit_abs[0] += t1 - t0;
++	sweet_adreno_submit_abs[1] += t2 - t1;
++	sweet_adreno_submit_abs[2] += mach_absolute_time() - t2;
+ 	sa_service_drop_lock();
+ 	return seqno;
+ }
+@@ -3516,22 +3719,9 @@ sa_gpu_words(uint64_t va, uint32_t words[8])
+ 		return false;
+ 	}
+ 	sa_service_take_lock();
+-	uint64_t *table = sa_core_space.table_count ? sa_core_space.table[0] : NULL;
+-	for (int shift = 30; table != NULL && shift > 12; shift -= 9) {
+-		uint64_t entry = table[(va >> shift) & 0x1ff];
+-		table = NULL;
+-		if ((entry & 3) != PTE_TABLE) {
+-			break;
+-		}
+-		for (uint32_t i = 0; i < sa_core_space.table_count; i++) {
+-			if (sa_core_space.table_phys[i] == (entry & PTE_ADDRESS)) {
+-				table = sa_core_space.table[i];
+-				break;
+-			}
+-		}
+-	}
+-	if (table != NULL) {
+-		uint64_t entry = table[(va >> 12) & 0x1ff];
++	uint64_t *pte = sa_space_find(&sa_core_space, va);
++	if (pte != NULL) {
++		uint64_t entry = *pte;
+ 		uint64_t pa = (entry & PTE_ADDRESS) | (va & 4095);
+ 		if ((entry & 3) == PTE_PAGE && pmap_valid_address(pa) &&
+ 		    pmap_valid_address(pa + 8 * sizeof(uint32_t) - 1)) {
+@@ -3560,6 +3750,7 @@ struct sa_word_cache {
+ 	uint64_t line;                  /* the page, despite the name (1: none yet) */
+ 	bool ok;
+ 	vm_offset_t kva;
++	struct sa_walk_pages *seen;
+ };
+ 
+ /*
+@@ -3676,22 +3867,9 @@ sa_gpu_page_kva(uint64_t va)
+ 	}
+ 	va &= ~4095ull;
+ 	sa_service_take_lock();
+-	uint64_t *table = sa_core_space.table_count ? sa_core_space.table[0] : NULL;
+-	for (int shift = 30; table != NULL && shift > 12; shift -= 9) {
+-		uint64_t entry = table[(va >> shift) & 0x1ff];
+-		table = NULL;
+-		if ((entry & 3) != PTE_TABLE) {
+-			break;
+-		}
+-		for (uint32_t i = 0; i < sa_core_space.table_count; i++) {
+-			if (sa_core_space.table_phys[i] == (entry & PTE_ADDRESS)) {
+-				table = sa_core_space.table[i];
+-				break;
+-			}
+-		}
+-	}
+-	if (table != NULL) {
+-		uint64_t entry = table[(va >> 12) & 0x1ff];
++	uint64_t *pte = sa_space_find(&sa_core_space, va);
++	if (pte != NULL) {
++		uint64_t entry = *pte;
+ 		uint64_t pa = entry & PTE_ADDRESS;
+ 		if ((entry & 3) == PTE_PAGE && pmap_valid_address(pa) && pmap_valid_address(pa + 4095)) {
+ 			vm_offset_t k = phystokv(pa);
+@@ -3713,8 +3891,18 @@ sa_gpu_word(struct sa_word_cache *c, uint64_t va, uint32_t *word)
+ {
+ 	uint64_t page = va & ~4095ull;
+ 	if (c->line != page) {
++		uint32_t slot = (uint32_t)(page >> 12) & (SA_WALK_PAGES - 1);
+ 		c->line = page;
+-		c->kva = sa_gpu_page_kva(page);
++		if (c->seen != NULL && c->seen->page[slot] == page) {
++			c->kva = c->seen->kva[slot];
++		} else {
++			c->kva = sa_gpu_page_kva(page);
++			sweet_adreno_walk_pages++;
++			if (c->seen != NULL && c->kva != 0) {
++				c->seen->page[slot] = page;
++				c->seen->kva[slot] = c->kva;
++			}
++		}
+ 		c->ok = c->kva != 0;
+ 	}
+ 	if (!c->ok || (va & 3)) {
+@@ -3797,7 +3985,7 @@ sweet_adreno_pte_phys(uint64_t iova)
+ {
+ 	uint64_t pa = 0;
+ 	sa_service_take_lock();
+-	uint64_t *pte = sa_space_pte(&sa_core_space, iova & ~4095ull);
++	uint64_t *pte = sa_space_find(&sa_core_space, iova & ~4095ull);
+ 	if (pte != NULL && (*pte & 3) == PTE_PAGE) {
+ 		pa = *pte & PTE_ADDRESS;
+ 	}
+@@ -3810,9 +3998,9 @@ sweet_adreno_pte_phys(uint64_t iova)
+  * the CP runs at each draw that the IB walk alone did not see). Returns false after reporting. */
+ static bool
+ sa_ib_walk(uint32_t seqno, uint32_t index, const char *what, uint32_t group, uint64_t start,
+-    uint32_t dwords, int depth)
++    uint32_t dwords, int depth, struct sa_walk_pages *seen)
+ {
+-	struct sa_word_cache c = { .line = 1 };
++	struct sa_word_cache c = { .line = 1, .seen = seen };
+ 	uint32_t at = 0, h = 0;
+ 	while (at < dwords) {
+ 		if (!sa_gpu_word(&c, start + 4ull * at, &h)) {
+@@ -3828,7 +4016,7 @@ sa_ib_walk(uint32_t seqno, uint32_t index, const char *what, uint32_t group, uin
+ 			    sa_gpu_word(&c, start + 4ull * (at + 2), &w[1]) && sa_gpu_word(&c, start + 4ull * (at + 3), &w[2])) {
+ 				uint64_t to = (uint64_t)w[1] << 32 | w[0];
+ 				if (w[2] != 0 && w[2] <= 8192 &&
+-				    !sa_ib_walk(seqno, index, "call", 0, to, w[2], depth + 1)) {
++				    !sa_ib_walk(seqno, index, "call", 0, to, w[2], depth + 1, seen)) {
+ 					return false;
+ 				}
+ 			}
+@@ -3841,7 +4029,7 @@ sa_ib_walk(uint32_t seqno, uint32_t index, const char *what, uint32_t group, uin
+ 				uint32_t count = w[0] & 0xffff;
+ 				uint64_t to = (uint64_t)w[2] << 32 | w[1];
+ 				if (!(w[0] & (3u << 17)) && count != 0 && to != 0 &&
+-				    !sa_ib_walk(seqno, index, "group", (w[0] >> 24) & 0x3f, to, count, depth + 1)) {
++				    !sa_ib_walk(seqno, index, "group", (w[0] >> 24) & 0x3f, to, count, depth + 1, seen)) {
+ 					return false;
+ 				}
+ 			}
+@@ -3868,7 +4056,7 @@ sa_ib_walk(uint32_t seqno, uint32_t index, const char *what, uint32_t group, uin
+ }
+ 
+ static void
+-sa_ib_check(uint32_t seqno, uint32_t index, uint64_t start, uint32_t dwords)
++sa_ib_check(uint32_t seqno, uint32_t index, uint64_t start, uint32_t dwords, struct sa_walk_pages *seen)
+ {
+ 	/* (0240) sweetgpucheck=0 turns the walk off - which shows stale frames (see sa_gpu_word): the walk
+ 	 * cleans the command and draw-state pages the CP will fetch. Default on, a page at a time. */
+@@ -3883,7 +4071,7 @@ sa_ib_check(uint32_t seqno, uint32_t index, uint64_t start, uint32_t dwords)
+ 	if (check != 1 || dwords > 8192 || sa_ib_check_logged >= 32) {
+ 		return;
+ 	}
+-	(void)sa_ib_walk(seqno, index, "top", 0, start, dwords, 0);
++	(void)sa_ib_walk(seqno, index, "top", 0, start, dwords, 0, seen);
+ }
+ 
+ static void
+@@ -4042,7 +4230,7 @@ sweet_adreno_wait_fence_ns(uint32_t fence, uint64_t timeout_ns)
+ 		sa_hang_fence = done;
+ 		sa_hang_first = now;
+ 		sa_hang_dumped = false;
+-	} else if (!sa_hang_dumped) {
++	} else if (!sa_hang_dumped && !sa_watchdog_on) {
+ 		uint64_t two_seconds;
+ 
+ 		nanoseconds_to_absolutetime(2000000000ull, &two_seconds);
+@@ -4172,6 +4360,251 @@ sweet_adreno_finish(void)
+ 	return true;                  /* budget spent: best effort, as before */
+ }
+ 
++/*
++ * (0282) A hung core is reset and goes on, instead of the screen flipping between two frames for good.
++ *
++ * What the hang is (umi-0273e.log, two boots): the SMMU reports a read translation fault of context 0 on a junk
++ * address (0, 0xed04100), CP_INTERRUPT_STATUS shows an opcode error at the same submit, and from then on the
++ * command processor stays busy inside one indirect buffer, the fence word stands still and every later
++ * submission queues behind it. Nothing cleared it: clients' waits timed out, Turnip called its device lost,
++ * backboardd kept presenting its two stale drawables. Linux recovers from this (a6xx_recover: halt the SQE,
++ * power-cycle the core, hw_init again, go on with the ring); nothing here did.
++ *
++ * A watchdog thread looks every 250 ms. With work pending, the core's progress is the fence word, the ring
++ * read position and the two indirect-buffer positions; when none of them moves for sweetgpuhang ms (default
++ * 1500, 0 = no watchdog) the core is hung. Recovery, under the service lock: SQE halted (CP_SQE_CNTL 3), the
++ * bus drained (Linux a6xx_bus_clear_pending_transactions), RBBM_SW_RESET_CMD pulsed (a6xx_gpu_sw_reset - the
++ * GMU, its votes and the zap shader in TrustZone are not touched), the SMMU fault cleared, step 20's registers
++ * written again, the ring emptied at the position the core reports, SQE started, CP_ME_INIT, CP_SET_SECURE_MODE
++ * 0, fence interrupts on again. Every submission that was pending is DROPPED and its fence signalled: the
++ * clients lose those frames' drawing (one bad frame) and go on; they are not told "faulted", because Turnip
++ * answers that with VK_ERROR_DEVICE_LOST, which ends the compositor's device.
++ * sweetgpuhangtest=N: N seconds after the steps, the watchdog submits an indirect buffer at an unmapped address
++ * once - the same read fault - to see the recovery work.
++ */
++#define RBBM_GBIF_HALT_ACK      GPU_WORD(0x0017)
++#define RBBM_SW_RESET_CMD       GPU_WORD(0x0043)
++#define GBIF_HALT_ACK           (4 * 0x46)      /* in sa_gbif (0x3c46) */
++
++static uint32_t sa_hang_ms = 1500;
++
++/* The ring has been read to the end and the core is idle, within ms. */
++static bool
++sa_ring_idle(uint32_t ms)
++{
++	for (uint32_t i = 0; i < ms * 10; i++) {
++		if (sa_rd(sa_gpu.base + CP_RB_RPTR) == sa_ring_sent &&
++		    !(sa_rd(sa_gpu.base + RBBM_STATUS) & RBBM_STATUS_GPU_BUSY)) {
++			return true;
++		}
++		delay_for_interval(100, NSEC_PER_USEC);
++	}
++	return false;
++}
++
++/* Context 0's fault, if any: logged (the first 16) and cleared. True when there was one. */
++static bool
++sa_smmu_fault_take(const char *when)
++{
++	uint32_t fsr = sa_rd(sa_smmu_cb0.base + SMMU_CB_FSR);
++	if ((fsr & SMMU_FSR_ALL) == 0) {
++		return false;
++	}
++	uint64_t far = (uint64_t)sa_rd(sa_smmu_cb0.base + SMMU_CB_FAR + 4) << 32 | sa_rd(sa_smmu_cb0.base + SMMU_CB_FAR);
++	uint32_t syn = sa_rd(sa_smmu_cb0.base + SMMU_CB_FSYNR0);
++	sa_wr(sa_smmu_cb0.base + SMMU_CB_FSR, fsr);
++	if (sa_smmu_faults++ < 16) {
++		IOLog("SWEET ADRENO: SMMU fault of the 3D core (%s): status %#x, address %#llx, syndrome %#x (%s, level %u); "
++		    "fence %u done of %u, ring read %u of %u, CP interrupts %#x [fault %u]\n", when, fsr,
++		    (unsigned long long)far, syn, (syn & 0x10) ? "write" : "read", syn & 3, sa_fence_read(), sa_fence_seqno,
++		    sa_rd(sa_gpu.base + CP_RB_RPTR), sa_ring_sent, sa_rd(sa_gpu.base + CP_INTERRUPT_STATUS), sa_smmu_faults);
++	}
++	return true;
++}
++
++/* Service lock held. */
++static bool
++sa_core_reset(void)
++{
++	uint32_t status_before = sa_rd(sa_gpu.base + RBBM_STATUS);
++
++	sa_wr(sa_gpu.base + CP_SQE_CNTL, 3);
++	sa_wr(sa_gpu.base + RBBM_GBIF_HALT, 1);
++	bool gx = sa_wait_for(&sa_gpu, RBBM_GBIF_HALT_ACK, 1, 1, 100);
++	sa_wr(sa_gbif.base + GBIF_HALT, 1);
++	bool client = sa_wait_for(&sa_gbif, GBIF_HALT_ACK, 1, 1, 100);
++	sa_wr(sa_gbif.base + GBIF_HALT, 2);
++	bool arb = sa_wait_for(&sa_gbif, GBIF_HALT_ACK, 2, 2, 100);
++	sa_wr(sa_gbif.base + GBIF_HALT, 0);
++	sa_wr(sa_gpu.base + RBBM_SW_RESET_CMD, 1);
++	(void)sa_rd(sa_gpu.base + RBBM_SW_RESET_CMD);
++	delay_for_interval(200, NSEC_PER_USEC);
++	sa_wr(sa_gpu.base + RBBM_SW_RESET_CMD, 0);
++	(void)sa_rd(sa_gpu.base + RBBM_SW_RESET_CMD);
++	delay_for_interval(200, NSEC_PER_USEC);
++	uint32_t status_reset = sa_rd(sa_gpu.base + RBBM_STATUS);
++	(void)sa_smmu_fault_take("at the reset");
++
++	sa_quiet = true;
++	sa_core_registers();
++	sa_quiet = false;
++	/* the ring is empty wherever the core's read position stands after the reset */
++	uint32_t rptr = sa_rd(sa_gpu.base + CP_RB_RPTR) % RING_WORDS;
++	sa_ring_at = sa_ring_sent = rptr;
++	sa_wr(sa_gpu.base + CP_RB_WPTR, rptr);
++	sa_wr(sa_gpu.base + CP_SQE_CNTL, 1);
++	delay_for_interval(2, NSEC_PER_MSEC);
++	sa_ring_packet(CP_ME_INIT, 8);
++	sa_ring(0x0000002f);
++	sa_ring(0x00000003);
++	sa_ring(0x20000000);
++	sa_ring(0);
++	sa_ring(0);
++	sa_ring(0);
++	sa_ring(0);
++	sa_ring(0);
++	sa_ring_send();
++	bool init = sa_ring_idle(500);
++	bool secure = false;
++	if (init) {
++		sa_ring_packet(CP_SET_SECURE_MODE, 1);
++		sa_ring(0);
++		sa_ring_send();
++		secure = sa_ring_idle(500);
++	}
++	if (sa_irq_on) {
++		sa_wr(sa_gpu.base + RBBM_INT_CLEAR_CMD, ~0u);
++		sa_wr(sa_gpu.base + RBBM_INT_0_MASK, RBBM_INT_CACHE_FLUSH_TS);
++	}
++	IOLog("SWEET ADRENO: reset of the 3D core: bus halts %d/%d/%d, status %#x -> %#x -> %#x, ring at %u, CP_ME_INIT %s, "
++	    "secure mode off %s, CP fault %#x / interrupts %#x, SMMU status %#x\n", gx, client, arb, status_before,
++	    status_reset, sa_rd(sa_gpu.base + RBBM_STATUS), rptr, init ? "ok" : "NOT taken", secure ? "ok" : "NOT done",
++	    sa_rd(sa_gpu.base + CP_HW_FAULT), sa_rd(sa_gpu.base + CP_INTERRUPT_STATUS),
++	    sa_rd(sa_smmu_cb0.base + SMMU_CB_FSR));
++	return init && secure;
++}
++
++/* The core is hung at fence word `done`: reset it, drop what was pending, wake the waiters. */
++static void
++sa_recover(uint32_t done, const char *why)
++{
++	sa_service_take_lock();
++	uint32_t now_done = sa_fence_read(), newest = sa_fence_seqno;
++	if (now_done != done || (int32_t)(now_done - newest) >= 0) {
++		sa_service_drop_lock();         /* it moved after all */
++		return;
++	}
++	IOLog("SWEET ADRENO: THE 3D CORE IS HUNG (%s): fence %u of %u, ring read %u of %u, IB1 %#x%08x left %u, IB2 "
++	    "%#x%08x left %u, status %#x, interrupts %#x, CP interrupts %#x; recovery %u\n", why, now_done, newest,
++	    sa_rd(sa_gpu.base + CP_RB_RPTR), sa_ring_sent, sa_rd(sa_gpu.base + CP_IB1_BASE + 4),
++	    sa_rd(sa_gpu.base + CP_IB1_BASE), sa_rd(sa_gpu.base + CP_IB1_REM_SIZE), sa_rd(sa_gpu.base + CP_IB2_BASE + 4),
++	    sa_rd(sa_gpu.base + CP_IB2_BASE), sa_rd(sa_gpu.base + CP_IB2_REM_SIZE), sa_rd(sa_gpu.base + RBBM_STATUS),
++	    sa_rd(sa_gpu.base + RBBM_INT_0_STATUS), sa_rd(sa_gpu.base + CP_INTERRUPT_STATUS), sa_recoveries + 1);
++	bool ok = sa_core_reset();
++	if (!ok) {
++		ok = sa_core_reset();           /* once more before giving up on this round */
++	}
++	sa_recoveries++;
++	sa_core_dead = !ok;
++	if (!ok) {
++		sa_recover_failures++;
++	}
++	/* every pending submission is gone with the reset: its fence counts as signalled */
++	volatile uint32_t *fence = (volatile uint32_t *)(sa_core_scratch.memory + (CORE_FENCE_ADDRESS - CORE_SCRATCH_ADDRESS));
++	sa_recover_dropped += newest - now_done;
++	*fence = newest;
++	flush_dcache64((addr64_t)(vm_offset_t)fence, 64, FALSE);
++	sa_hang_fence = ~0u;
++	IOLog("SWEET ADRENO: recovery %u %s: %u submission(s) dropped (fences %u..%u signalled); %u recoveries, %u failed, "
++	    "%u dropped since boot\n", sa_recoveries, ok ? "done, the core runs again" : "FAILED, the core does not answer",
++	    newest - now_done, now_done + 1, newest, sa_recoveries, sa_recover_failures, sa_recover_dropped);
++	sa_service_drop_lock();
++	thread_wakeup((event_t)&sa_fence_irq);
++}
++
++static void
++sa_watchdog(__unused void *arg, __unused wait_result_t wr)
++{
++	uint32_t still_ms = 0, test_s = 0, last[6] = { 0 };
++	uint64_t ticks = 0;
++
++	(void)PE_parse_boot_argn("sweetgpuhangtest", &test_s, sizeof(test_s));
++	printf("SWEET GPU: hang watchdog: recovery after %u ms without progress%s\n", sa_hang_ms,
++	    test_s ? "; a faulting submission will be injected (sweetgpuhangtest)" : "");
++	for (;;) {
++		sa_sleep_ms(250);
++		ticks++;
++		if (test_s != 0 && ticks == (uint64_t)test_s * 4) {
++			/* the test: an indirect buffer where nothing is mapped (a read fault, as the real hangs) */
++			sa_service_take_lock();
++			if (sa_ring_room(16)) {
++				uint32_t seqno = ++sa_fence_seqno;
++				sa_ring_packet(CP_INDIRECT_BUFFER, 3);
++				sa_ring(0x00001000);
++				sa_ring(0);
++				sa_ring(64);
++				sa_ring_packet(CP_EVENT_WRITE, 4);
++				sa_ring(EVENT_CACHE_FLUSH_TS | EVENT_IRQ);
++				sa_ring(CORE_FENCE_ADDRESS);
++				sa_ring(0);
++				sa_ring(seqno);
++				sa_ring_send();
++				IOLog("SWEET ADRENO: hang test: fence %u is an indirect buffer at an unmapped address\n", seqno);
++			}
++			sa_service_drop_lock();
++		}
++		uint32_t done = sa_fence_read(), newest = sa_fence_seqno;
++		if ((int32_t)(done - newest) >= 0) {
++			still_ms = 0;
++			if (sa_smmu_faults < 16 && (sa_rd(sa_smmu_cb0.base + SMMU_CB_FSR) & SMMU_FSR_ALL)) {
++				sa_service_take_lock();
++				(void)sa_smmu_fault_take("idle");       /* a fault the core got over by itself */
++				sa_service_drop_lock();
++			}
++			continue;
++		}
++		uint32_t now[6] = { done, sa_rd(sa_gpu.base + CP_RB_RPTR), sa_rd(sa_gpu.base + CP_IB1_BASE),
++			            sa_rd(sa_gpu.base + CP_IB1_REM_SIZE), sa_rd(sa_gpu.base + CP_IB2_BASE),
++			            sa_rd(sa_gpu.base + CP_IB2_REM_SIZE) };
++		if (memcmp(now, last, sizeof(now)) != 0) {
++			memcpy(last, now, sizeof(now));
++			still_ms = 0;
++			continue;
++		}
++		still_ms += 250;
++		if (still_ms < sa_hang_ms) {
++			continue;
++		}
++		still_ms = 0;
++		if (sa_recoveries < 2) {
++			sa_hang_dump(done + 1);         /* the long form, for the first two */
++		}
++		sa_recover(done, sa_core_dead ? "still dead" : "no progress");
++		if (sa_core_dead && sa_recover_failures > 4) {
++			sa_sleep_ms(10000);             /* it does not come back: try again now and then, quietly */
++		}
++	}
++}
++
++static void
++sa_watchdog_start(void)
++{
++	thread_t thread;
++
++	(void)PE_parse_boot_argn("sweetgpuhang", &sa_hang_ms, sizeof(sa_hang_ms));
++	if (sa_hang_ms == 0 || !sa_core_runs) {
++		printf("SWEET GPU: no hang watchdog (sweetgpuhang=%u)\n", sa_hang_ms);
++		return;
++	}
++	if (sa_hang_ms < 500) {
++		sa_hang_ms = 500;
++	}
++	if (kernel_thread_start(sa_watchdog, NULL, &thread) == KERN_SUCCESS) {
++		sa_watchdog_on = true;
++		thread_deallocate(thread);
++	}
++}
++
+ static bool (*const sa_step_fn[])(void) = {
+ 	NULL, sa_step_outside, sa_step_fuses, sa_step_gpucc, sa_step_cx_power, sa_step_clocks, sa_step_gmu_read,
+ 	sa_step_rscc, sa_step_smmu, sa_step_smmu_context, sa_step_gmu_memory, sa_step_trustzone, sa_step_zap_signature,
+@@ -4198,6 +4631,7 @@ sa_thread(__unused void *arg, __unused wait_result_t wr)
+ 		printf("SWEET GPU: the 3D core was asked for: leaving the GPU block as it is (%u writes not undone)\n",
+ 		    sa_undo_count);
+ 		sa_irq_start();
++		sa_watchdog_start();
+ 	} else {
+ 		sa_zap_release();
+ 		sa_undo_all();
+diff --git a/iokit/Kernel/arm/SweetAdreno.cpp b/iokit/Kernel/arm/SweetAdreno.cpp
+index e48dd28..049cb66 100644
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -47,6 +47,7 @@ extern "C" {
+ 	bool sweet_board_is_umi(void);           /* bsd/dev/sweet_rpmh.c */
+ 	int sweet_adreno_window_alloc(task_t task, uint64_t *base, uint64_t *size);
+ 	void sweet_adreno_window_free(uint64_t base);
++	uint32_t sweet_adreno_tables(uint32_t *max_tables);
+ 	int sweet_adreno_map_at(uint64_t iova, const uint64_t *pages, uint32_t n);
+ 	void sweet_adreno_unmap_at(uint64_t iova, uint64_t len);
+ 	extern uint64_t sweet_adreno_bad_iova;
+@@ -222,6 +223,7 @@ public:
+ 	uint32_t       fLastFence;
+ 	uint32_t       fLogged;        /* bring-up: first calls of each kind get a line */
+ 	uint32_t       fSubmitLogged;  /* the submit budget is its own: a shared one never reached it */
++	uint32_t       fMapLogged;
+ 	int            fStat;          /* (0249) this client's slot in sa_clients, -1: none */
+ };
+ 
+@@ -238,6 +240,7 @@ static struct sa_client_stat {
+ 	char     name[20];
+ 	uint64_t alloc_bytes, import_bytes, peak_bytes;
+ 	uint32_t alloc_n, import_n;
++	uint32_t submits, submits_last;         /* (0282) who draws: submits since the last report */
+ } sa_clients[SA_CLIENTS];
+ static uint32_t sa_alloc_failures;
+ static uint32_t sa_cap_refusals;     /* (0251) */
+@@ -248,24 +251,31 @@ sa_memory_report(const char *why)
+ {
+ 	char line[600];
+ 	uint64_t total = 0;
++	for (int i = 0; i < SA_CLIENTS; i++) {
++		if (sa_clients[i].used) {
++			total += sa_clients[i].alloc_bytes + sa_clients[i].import_bytes;
++		}
++	}
++	uint32_t max_tables = 0, tables = sweet_adreno_tables(&max_tables);
++	/* (0251) totals on a line of their own: with ten clients the per-client line is cut off in the log */
++	IOLog("SWEET ADRENO: GPU memory (%s) total %llu MB; wired %u MB, free %u MB, tables %u/%u, %u failed allocs, %u refused by caps\n",
++	    why, total >> 20, (unsigned)(((uint64_t)vm_page_wire_count * PAGE_SIZE) >> 20),
++	    (unsigned)(((uint64_t)vm_page_free_count * PAGE_SIZE) >> 20), tables, max_tables, sa_alloc_failures, sa_cap_refusals);
+ 	int n = snprintf(line, sizeof(line), "SWEET ADRENO: memory (%s):", why);
+ 	for (int i = 0; i < SA_CLIENTS; i++) {
+ 		struct sa_client_stat *c = &sa_clients[i];
+ 		if (!c->used) {
+ 			continue;
+ 		}
+-		uint64_t mine = c->alloc_bytes + c->import_bytes;
+-		total += mine;
+-		if (n < (int)sizeof(line) - 80) {
+-			n += snprintf(line + n, sizeof(line) - n, " %s[%d]%s %llu MB/%u (imp %llu MB/%u, peak %llu MB);", c->name,
+-			    c->pid, c->closed ? " CLOSED" : "", c->alloc_bytes >> 20, c->alloc_n, c->import_bytes >> 20, c->import_n,
+-			    c->peak_bytes >> 20);
++		if (n >= (int)sizeof(line) - 100) {
++			IOLog("%s\n", line);
++			n = snprintf(line, sizeof(line), "SWEET ADRENO: memory (%s)+:", why);
+ 		}
++		n += snprintf(line + n, sizeof(line) - n, " %s[%d]%s %llu MB/%u (imp %llu MB/%u, peak %llu MB, %u submits);",
++		    c->name, c->pid, c->closed ? " CLOSED" : "", c->alloc_bytes >> 20, c->alloc_n, c->import_bytes >> 20,
++		    c->import_n, c->peak_bytes >> 20, c->submits - c->submits_last);
++		c->submits_last = c->submits;
+ 	}
+-	/* (0251) totals on a line of their own: with ten clients the per-client line is cut off in the log */
+-	IOLog("SWEET ADRENO: GPU memory (%s) total %llu MB; wired %u MB, free %u MB, %u failed allocs, %u refused by caps\n",
+-	    why, total >> 20, (unsigned)(((uint64_t)vm_page_wire_count * PAGE_SIZE) >> 20),
+-	    (unsigned)(((uint64_t)vm_page_free_count * PAGE_SIZE) >> 20), sa_alloc_failures, sa_cap_refusals);
+ 	IOLog("%s\n", line);
+ }
+ 
+@@ -363,6 +373,7 @@ SweetAdrenoUserClient::initWithTask(task_t owningTask, void *securityID, UInt32
+ 				proc_selfname(c->name, sizeof(c->name));
+ 				c->alloc_bytes = c->import_bytes = c->peak_bytes = 0;
+ 				c->alloc_n = c->import_n = 0;
++				c->submits = c->submits_last = 0;
+ 				fStat = i;
+ 				break;
+ 			}
+@@ -665,6 +676,9 @@ SweetAdrenoUserClient::v2Release(SweetAdrenoUserClient::BO *bo)
+ 
+ /* (0240) Calls and kernel time per v2 method, all clients, printed every sweettop round (sweet_adreno_top). */
+ #define SA_METHODS 17
++static uint64_t sa_part_abs[2], sa_part_bytes[2];       /* (0282) submit: command-BO clean, small-import clean */
++extern "C" uint64_t sweet_adreno_walk_pages;
++extern "C" uint64_t sweet_adreno_submit_abs[3];         /* bsd/dev/sweet_adreno.c: walk, lock + ring room, ring */
+ static uint64_t sa_method_calls[SA_METHODS], sa_method_abs[SA_METHODS], sa_method_last[2][SA_METHODS];
+ 
+ extern "C" void sweet_adreno_method_top(void);
+@@ -686,6 +700,21 @@ sweet_adreno_method_top(void)
+ 		}
+ 	}
+ 	IOLog("%s\n", line);
++	/* (0282) where the submits' kernel time went */
++	static uint64_t lastAbs[5], lastBytes[2], lastWalk;
++	uint64_t nowAbs[5] = { sa_part_abs[0], sa_part_abs[1], sweet_adreno_submit_abs[0], sweet_adreno_submit_abs[1],
++		               sweet_adreno_submit_abs[2] }, ms[5];
++	for (int i = 0; i < 5; i++) {
++		absolutetime_to_nanoseconds(nowAbs[i] - lastAbs[i], &ms[i]);
++		ms[i] /= 1000000;
++		lastAbs[i] = nowAbs[i];
++	}
++	IOLog("SWEET ADRENO: submit parts (ms): command clean %llu (%llu KB), small-import clean %llu (%llu KB), walk %llu (%llu pages), "
++	    "lock + ring room %llu, ring %llu\n", ms[0], (sa_part_bytes[0] - lastBytes[0]) >> 10, ms[1],
++	    (sa_part_bytes[1] - lastBytes[1]) >> 10, ms[2], sweet_adreno_walk_pages - lastWalk, ms[3], ms[4]);
++	lastWalk = sweet_adreno_walk_pages;
++	lastBytes[0] = sa_part_bytes[0];
++	lastBytes[1] = sa_part_bytes[1];
+ 	sa_memory_report("10 s");                 /* (0249) */
+ }
+ 
+@@ -858,8 +887,12 @@ SweetAdrenoUserClient::v2Method(uint32_t method, const void *in, uint32_t inSize
+ 	case NativeAdrenoMethodBoMap: {
+ 		V2_IN(NativeAdrenoAbiBoMap);
+ 		V2_OUT(NativeAdrenoAbiBoMapReply);
+-		IOLog("SWEET ADRENO: BoMap(handle %llu, iova %#llx, perms %u, wb %u, share %u, reserved %u)\n",
+-		    rq->handle, rq->iova, rq->permissions, rq->writeback, rq->shareability, rq->reserved);
++		/* (0282) the first few per client only: one IOLog per BoMap was hundreds of lines in a busy 10 s */
++		if (fMapLogged < 4) {
++			fMapLogged++;
++			IOLog("SWEET ADRENO: BoMap(handle %llu, iova %#llx, perms %u, wb %u, share %u, reserved %u)\n",
++			    rq->handle, rq->iova, rq->permissions, rq->writeback, rq->shareability, rq->reserved);
++		}
+ 		if (!(rq->permissions & 1) || (rq->permissions & ~3u) || (rq->iova & 4095) || rq->reserved) {
+ 			IOLog("SWEET ADRENO: BoMap refused: header checks\n");
+ 			return kIOReturnBadArgument;
+@@ -900,6 +933,8 @@ SweetAdrenoUserClient::v2Method(uint32_t method, const void *in, uint32_t inSize
+ 				    rq->handle, rq->iova, bo->bytes);
+ 				r = kIOReturnNoSpace;
+ 			} else if (mr != 0) {
++				IOLog("SWEET ADRENO: BoMap refused: handle %llu iova %#llx+%#llx map_at %d\n",
++				    rq->handle, rq->iova, bo->bytes, mr);
+ 				r = kIOReturnNoResources;
+ 			} else if (r == kIOReturnSuccess) {
+ 				mapped = off;
+@@ -974,6 +1009,9 @@ SweetAdrenoUserClient::v2Method(uint32_t method, const void *in, uint32_t inSize
+ 		 * Imports are NOT cleaned here: their pages are also render targets the GPU writes,
+ 		 * and a stale CPU line would be pushed over the frame the GPU just drew (horizontal
+ 		 * stripe corruption, 0183) - the CPU's writes are cleaned once, at BoMap */
++		/* (0282) only the submitted part of each such BO (to whole 4 KB pages), not the whole BO: Turnip's
++		 * command BOs grow to megabytes and a submit names a few KB of them. */
++		uint64_t tClean = mach_absolute_time();
+ 		for (uint32_t i = 0; i < fBOCap; i++) {
+ 			BO *bo = &fBO[i];
+ 			if (bo->md == NULL || bo->iova == 0 || bo->kmap == NULL || bo->imported) {
+@@ -982,11 +1020,18 @@ SweetAdrenoUserClient::v2Method(uint32_t method, const void *in, uint32_t inSize
+ 			for (uint32_t b = 0; b < rq->buffer_count; b++) {
+ 				uint64_t s = rq->buffers[b].iova, e = s + rq->buffers[b].bytes;
+ 				if (s < bo->iova + bo->bytes && e > bo->iova) {
+-					sweet_adreno_clean((vm_offset_t)bo->kmap->getVirtualAddress(), bo->bytes);
+-					break;
++					uint64_t from = (s > bo->iova ? s - bo->iova : 0) & ~4095ull;
++					uint64_t to = e < bo->iova + bo->bytes ? (e - bo->iova + 4095) & ~4095ull : bo->bytes;
++					if (to > bo->bytes) {
++						to = bo->bytes;
++					}
++					sweet_adreno_clean((vm_offset_t)bo->kmap->getVirtualAddress() + from, to - from);
++					OSAddAtomic64((SInt64)(to - from), (volatile SInt64 *)&sa_part_bytes[0]);
+ 				}
+ 			}
+ 		}
++		uint64_t tImport = mach_absolute_time();
++		OSAddAtomic64((SInt64)(tImport - tClean), (volatile SInt64 *)&sa_part_abs[0]);
+ 		/* (0247) ...except small imports: the host memory CoreAnimation's CPU-drawn layers arrive in (text,
+ 		 * icons - shared memory the app redraws in place). Cleaned only at BoMap, a redraw never reached the
+ 		 * GPU: stale glyphs in Settings and the App Library with everything else clean (0246). Imports up to
+@@ -1004,8 +1049,10 @@ SweetAdrenoUserClient::v2Method(uint32_t method, const void *in, uint32_t inSize
+ 				if (bo->md != NULL && bo->iova != 0 && bo->kmap != NULL && bo->imported && bo->bytes <= impLimit) {
+ 					sweet_adreno_clean((vm_offset_t)bo->kmap->getVirtualAddress(), bo->bytes);
+ 					impBytes += bo->bytes;
++					OSAddAtomic64((SInt64)bo->bytes, (volatile SInt64 *)&sa_part_bytes[1]);
+ 				}
+ 			}
++			OSAddAtomic64((SInt64)(mach_absolute_time() - tImport), (volatile SInt64 *)&sa_part_abs[1]);
+ 			if ((++impSubmits % 2000) == 0) {
+ 				IOLog("SWEET ADRENO: small imports cleaned before submits: %llu MB over the last 2000\n",
+ 				    impBytes >> 20);
+@@ -1020,6 +1067,9 @@ SweetAdrenoUserClient::v2Method(uint32_t method, const void *in, uint32_t inSize
+ 			return busy ? kIOReturnBusy : kIOReturnNotReady;
+ 		}
+ 		fLastFence = fence;
++		if (fStat >= 0) {
++			sa_clients[fStat].submits++;
++		}
+ 		/* the submit check found a word that is no packet (0196): which of this client's BOs holds
+ 		 * it, and do the GPU's page table, the BO's own pages and the kernel's view of them agree? */
+ 		if (sweet_adreno_bad_iova != 0) {
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 5349296..e66a365 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -536,6 +536,11 @@ static uint32_t sweet_fb_direct_fail[4];     /* 0: layer count, 1: no surface, 2
+ 
+ /* (0246) Every 10 s: how many presents went out directly and how many fell back to the copy path (which writes
+  * into the boot framebuffer while the panel scans it - tearing), by reason. Totals since boot. */
++/* (0282) Frame times: the gap between presents, in buckets, and what the present waited for the GPU. Gaps up to
++ * 250 ms are "animating" (their mean gives the frame rate while something moves); longer ones are the screen at rest. */
++static uint32_t sweet_fb_gap_hist[6];           /* <= 20, 36, 52, 100, 250 ms, longer */
++static uint64_t sweet_fb_gap_anim_abs, sweet_fb_fin_abs, sweet_fb_fin_max_abs;
++
+ static void
+ sweet_fb_path_stats(void)
+ {
+@@ -543,6 +548,19 @@ sweet_fb_path_stats(void)
+ 	if (sweet_fb_present_count == last) {
+ 		return;
+ 	}
++	uint64_t frames = sweet_fb_present_count - last;
++	uint32_t anim = sweet_fb_gap_hist[0] + sweet_fb_gap_hist[1] + sweet_fb_gap_hist[2] + sweet_fb_gap_hist[3] +
++	    sweet_fb_gap_hist[4];
++	uint64_t anim_us = sweet_fb_gap_anim_abs * 10 / 192;      /* 19.2 MHz ticks */
++	IOLog("SWEET FB: frames %llu: gaps <=20 ms %u, <=36 %u, <=52 %u, <=100 %u, <=250 %u, longer %u; animating %u.%u fps "
++	    "(mean gap %llu.%llu ms over %u); GPU wait mean %llu us, max %llu us\n", frames, sweet_fb_gap_hist[0],
++	    sweet_fb_gap_hist[1], sweet_fb_gap_hist[2], sweet_fb_gap_hist[3], sweet_fb_gap_hist[4], sweet_fb_gap_hist[5],
++	    anim_us ? (uint32_t)((uint64_t)anim * 1000000 / anim_us) : 0,
++	    anim_us ? (uint32_t)((uint64_t)anim * 10000000 / anim_us % 10) : 0,
++	    anim ? anim_us / anim / 1000 : 0, anim ? anim_us / anim / 100 % 10 : 0, anim,
++	    sweet_fb_fin_abs * 10 / 192 / frames, sweet_fb_fin_max_abs * 10 / 192);
++	bzero(sweet_fb_gap_hist, sizeof(sweet_fb_gap_hist));
++	sweet_fb_gap_anim_abs = sweet_fb_fin_abs = sweet_fb_fin_max_abs = 0;
+ 	last = sweet_fb_present_count;
+ 	uint64_t fails = (uint64_t)sweet_fb_direct_fail[0] + sweet_fb_direct_fail[1] + sweet_fb_direct_fail[2] +
+ 	    sweet_fb_direct_fail[3];
+@@ -1341,11 +1359,28 @@ AppleCLCD::present(const uint8_t *rec)
+ 		    mask, fDirect ? "direct" : "copy",
+ 		    sweet_fb_last_present_t != 0 ? (now - sweet_fb_last_present_t) / 19200ull : 0, now);
+ 	}
++	if (sweet_fb_last_present_t != 0) {             /* (0282) */
++		static const uint32_t edge_ms[5] = { 20, 36, 52, 100, 250 };
++		uint64_t gap = now - sweet_fb_last_present_t;
++		int b = 0;
++		while (b < 5 && gap > (uint64_t)edge_ms[b] * 19200) {
++			b++;
++		}
++		sweet_fb_gap_hist[b]++;
++		if (b < 5) {
++			sweet_fb_gap_anim_abs += gap;
++		}
++	}
+ 	sweet_fb_last_present_t = now;
+ 
+ 	/* the layers were rendered by the GPU (Metal on Turnip): wait for it before
+ 	 * the CPU reads them - CoreAnimation expects the Metal present to sync */
+ 	bool fin = sweet_adreno_finish();
++	uint64_t fin_abs = mach_absolute_time() - now;
++	sweet_fb_fin_abs += fin_abs;
++	if (fin_abs > sweet_fb_fin_max_abs) {
++		sweet_fb_fin_max_abs = fin_abs;
++	}
+ 	static uint32_t fin_logged;
+ 	if (fin_logged++ < 32) {
+ 		IOLog("SWEET FB: present %llu finish fence wait %s\n",
+-- 
+2.54.0 (Apple Git-157)
+

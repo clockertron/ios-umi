@@ -93,11 +93,11 @@
 |---|---|---|
 | ⚙️ Power-up | GMU / RPMh, zap shader authenticated by TrustZone | ✅ |
 | 🧾 Command streams | The command processor runs our streams | ✅ |
-| 🎨 Metal | Over Mesa's turnip (`sweetmtl`) and the metal2vulkan bridge (ios-apollo's series), fence interrupts; a per-submit command walk still costs CPU | ✅ |
+| 🎨 Metal | Over Mesa's turnip (`sweetmtl`) and the metal2vulkan bridge (ios-apollo's series), fence interrupts; a hung GPU is reset and goes on (0282); submits ~2 ms of kernel time (was ~8) | ✅ |
 | 📱 Metal for every app | `/var/local/mtl2-clients` = `*`: SpringBoard, posters, widgets, Safari and any app get a Metal device; the AegirPoster crash loop is gone | ✅ |
 | 🧭 Safari | Pages draw on the GPU (WebKit.GPU); the address bar glitches, the status bar is white, a link tap sometimes does nothing | ⚠️ |
 | 🧮 GPU memory | Wired RAM, reported per app every 10 s; caps (kernel 0251): 768 MB per app, 1536 MB for all apps, 1 GB of RAM kept free; backboardd and SpringBoard uncapped. GPU address windows given back when a process exits (0250) | ✅ |
-| 🖼️ CoreAnimation on the GPU | Composites through Metal on the GPU and scans out directly; only the App Library background blur still glitches; backboardd median ~20 % of a core, more when animating | ✅ |
+| 🖼️ CoreAnimation on the GPU | Composites through Metal on the GPU and scans out directly; only the App Library background blur still glitches; backboardd 11 % of a core at rest, 21-37 fps while animating (0282) | ✅ |
 
 ## 🧠 CPU and performance
 
@@ -132,7 +132,7 @@
 * **Audio**: microphones, the earpiece as the second channel, an earlier ADSP start, ADSP restart after a crash,
   haptics on the Actuator
 * **Video**: hardware decode (VideoToolbox / AVD)
-* **GPU**: Safari's address bar / white status bar and link taps; the App Library blur; apps that hit the memory caps (check what they do with a nil buffer); drop the per-submit cache walk (make Turnip's write-combined command memory coherent without it), less CPU per frame
+* **GPU**: why the core sometimes reads a junk address (the hang that 0282 now recovers from); the 10 Hz redraw at rest; GPU frequency scaling and clock gating (`sweetgpuhwcg=1`, untested); Safari's address bar / white status bar and link taps; the App Library blur; apps that hit the memory caps (check what they do with a nil buffer); drop the per-submit cache walk (make Turnip's write-combined command memory coherent without it), less CPU per frame
 * **RAM**: ~7 GB by moving our DSP / Wi-Fi buffers into free low RAM (0x92700000-0xb03fffff) and starting iOS at 0xc0000000
 * **Charging**: why a 3 A USB-PD charger only gives ~+0.6 A (AICL?); QC 3.0 test with a QC charger; USB-PD and the SMB1390 charge pump for 30 W
 * **Audio**: check that the speaker still plays with the plug-in's hardware volume control removed (installed, not yet loaded)

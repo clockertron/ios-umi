@@ -2,6 +2,58 @@
 
 ## umi (Xiaomi Mi 10, SM8250) port - branch `umi` on qcom-toolbox/ios-sweet (2026-10-20)
 
+- **2026-11-11 23:00: 0282 GPU: THE "2-FRAME LOOP" IS A GPU HANG - the core is now reset and goes on; submits 4x
+  cheaper** (patch `xnu/patches/0282-umi-gpu-recovery-fast-submit.patch`, kernel d67c463; image
+  **`shim/out/umi-0282b-gpu.img`** = the daily boot line; test image `umi-0282t-hangtest.img` = that line without
+  `sweetampstepms=200` + `sweetgpuhangtest=150`; logs: session scratchpad `umi-0282t.log`, `umi-0282b.log`). The patch
+  also carries the page-table fix that was uncommitted since 0253 (SA_TABLES_MAX 8192, window reuse).
+  - **What the loop is** (umi-0273e.log, both bad boots: fence stuck at 1056 and at 336): at one submit the SMMU
+    reports a READ translation fault of context 0 on a junk address (0; 0xed04100; status 0x80000402, level 2) and
+    CP_INTERRUPT_STATUS shows an opcode error; from then on RBBM_STATUS is 0x800005 (only the CP busy), the CP sits
+    inside one indirect buffer, the fence word stands still and every later submission queues behind it. Nothing
+    recovered: presents waited 500 ms each and flipped between backboardd's two stale drawables. And since the fault
+    status was never cleared, every later submit counted a fault, so every client's GetStatus said "faulted" =
+    `VK_ERROR_DEVICE_LOST` in Turnip, for all processes. The "N timed out" counter alone is NOT the sign (0 ns polls
+    count); the sign is `fence X (submitted Y)` with Y running away, and `presents waited ... timed out`.
+  - **Why the core reads a junk address is still open.** Both times it followed a burst of BoMaps of fresh command /
+    draw-state BOs (app launch; display dimming). The submit walk saw valid commands at submit time. Each fault is now
+    logged at once with address, direction, level, fence and ring position (`SMMU fault of the 3D core`).
+  - **Recovery (new):** a watchdog thread looks every 250 ms; with work pending and the fence word, CP_RB_RPTR and
+    the IB1/IB2 positions all still for `sweetgpuhang` ms (default 1500, 0 = off) the core is hung. Then, under the
+    service lock: CP_SQE_CNTL 3, bus drained (RBBM_GBIF_HALT, GBIF_HALT client then arbiter, as Linux
+    a6xx_bus_clear_pending_transactions), **RBBM_SW_RESET_CMD pulsed** (Linux a6xx_gpu_sw_reset; Linux power-cycles
+    GMU targets instead - here the GMU, its votes and the zap shader are left alone), SMMU fault cleared, step 20's
+    registers again (`sa_core_registers`, quiet), ring emptied at the position the core reports, SQE on, CP_ME_INIT,
+    CP_SET_SECURE_MODE 0, fence interrupt mask again. Pending submissions are dropped and their fences signalled;
+    clients are not told (no device lost). The first two recoveries print the long dump first.
+  - **Tested (0282t, injected IB at unmapped 0x1000 at 150 s):** same signature as the real hang (`status 0x800005`,
+    fence 3262 of 3272), then `reset of the 3D core: bus halts 1/1/1, status 0x800005 -> 0x1 -> 0x1, ring at 0,
+    CP_ME_INIT ok, secure mode off ok` and `recovery 1 done ... 10 submission(s) dropped`; fences advanced normally in
+    every later round, 0 failed, no device lost. **So a software reset is enough on the A650 with a GMU.**
+  - **Speed, measured with two new 10 s lines** (`SWEET ADRENO: submit parts (ms)`, `SWEET FB: frames N: gaps ...;
+    animating F fps; GPU wait`): on 0282t (old walk) **the per-submit walk was 95 % of the submit call** - 761 of
+    781 ms per 100 submits, 7-9 ms per submit. It made a fresh one-page cache for every draw-state group and called
+    IB, so the same few pages were translated, cleaned+invalidated and read back cold hundreds of times per submit.
+    Now a submit visits each page once (`sweetgpuwalk=0` = old). Also: only the page-table pages written since the
+    last flush are cleaned per map / unmap (was all of them, 1.4 MB at 340 tables), table lookups go through a
+    small cache (was a linear search, twice per 4 KB page), unmaps no longer create tables, the command-BO clean
+    covers only the submitted pages, and BoMap is no longer logged per call.
+    | | 0282t (old walk) | 0282b |
+    |---|---|---|
+    | submit, screen at rest (100 per 10 s) | 780-880 ms | **189 ms** |
+    | submit, busy round | 2-9 ms each (0273e) | 1.4-1.6 ms each (686 in 990 ms) |
+    | backboardd at rest | 16-17 % (sys 9-10 %) | **11 % (sys 3 %)** |
+    | map + free, busy round | up to 525 + 345 ms (0273e) | 105 + 51 ms (557 + 215 calls) |
+    Frames on 0282b while the user used the UI: 414 in 10 s, 348 of them within 36 ms, "animating 34.5 fps"; other
+    busy rounds 21-37 fps. Baseline (0273e, 591 rounds, presents per 10 s): median 104, p90 202, max 485. In the busy
+    rounds the time is now in fence waits (3.4 s of 10 s: the GPU itself) and backboardd's user time (66 %), not the
+    kernel. The user's verdict on glitches with the faster walk is still missing (0240-0243 found the walk kept
+    frames right "by its time").
+  - **Seen, not looked into:** at rest backboardd alone submits and presents at exactly 10 Hz, for ever (SpringBoard
+    0 submits) - something stays dirty; the bandwidth table sent to the GMU has one "off" level (no DDR vote for the
+    GPU); phone at 70 C / GPU 67.5 C, CPUs capped.
+  - **Opt-in, untested:** `sweetgpuhwcg=1` programs Linux's a650_hwcg clock gating in step 20 (the SP clock off
+    around it, RBBM_CLOCK_CNTL 0x8aa8aa82; the three GMU CGC registers are left alone).
 - **2026-11-11 21:25: Control Center's cellular data button works; the Cellular Data switch** (sweet-telephonyd this
   commit; patch `xnu/patches/0281-umi-x55-data-switch.patch`, kernel 0280, image `shim/out/umi-0280-data-switch.img`).
   - Settings / SpringBoard ask the legacy plain-XPC API: kPacketGetProperty `kEnableCellularData` (the user switch),
