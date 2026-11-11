@@ -33,12 +33,13 @@ The project started on the Redmi Note 10 Pro (`sweet`, SM7150), hence its name; 
 | USB | ECM gadget (USB Ethernet) with a live kernel log and a small kernel file server for development |
 | GPU | Adreno 650 powered through GMU/RPMh, zap shader authenticated by TrustZone; Metal over Mesa's turnip and a metal2vulkan bridge for CoreAnimation and every app that asks (`/var/local/mtl2-clients` = `*`), Safari included; per-app GPU memory caps |
 | Bluetooth | QCA6390 over UART: scan, connect and pair in Settings (more in [`Status.md`](Status.md)) |
+| Cellular | Snapdragon X55 modem brought up by the kernel over PCIe2 (`sweetmdm=10 sweetmdmonline=1`): SIM, LTE registration, carrier name and signal bars in the status bar, and **mobile data** (Safari over LTE) through the kernel's `pdp_ip0` and `sweet-telephonyd`, a stand-in for CommCenter. IPv4 only; no calls or SMS |
 | Device identity | iPhone X (`iPhone10,3` / `D22AP`): no Home button, gesture UI |
 | Activation | Native "Hactivation" path of mobileactivationd, chosen through device-tree security status. No Apple servers involved |
 
 ## What does not work (yet)
 
-- **No cellular, camera, motion sensors or SEP / Face ID**, and no GPS receiver (location itself works, from Wi-Fi). Daemons for them start and fail or keep relaunching. Bluetooth audio is untested.
+- **No calls or SMS, camera, motion sensors or SEP / Face ID**, and no GPS receiver (location itself works, from Wi-Fi). Daemons for them start and fail or keep relaunching. Bluetooth audio is untested.
 - **No True Tone**: the light sensor reports brightness only, not color.
 - **No microphones** yet, and the earpiece speaker is not used as a second channel.
 - **No hardware video decoding** (VideoToolbox / AVD), so videos do not play; music apps never reached the audio system in tests.
