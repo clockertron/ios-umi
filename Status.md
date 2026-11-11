@@ -25,7 +25,7 @@
 | 🔊 Audio | Speaker works (ringtones, system sounds); no microphones, earpiece not used | ⚠️ |
 | 🛜 WiFi | 2.4 GHz, open + WPA2-PSK, legacy rates | ⚠️ |
 | 🦷 Bluetooth | QCA6390 over UART (921600 baud): scan, connect and pair in Settings, Control Center button, off / on (slow); see the tests below | ⚠️ |
-| 📶 Cellular Data | The X55 modem boots from the kernel and stays registered on LTE with the SIM (kernels 0272-0273); the status bar shows the carrier (Sunrise) with signal bars through sweet-telephonyd, the CommCenter stand-in. **Mobile data works: Safari loads pages over LTE with Wi-Fi off**, status bar shows LTE (kernel 0277/0278: `pdp_ip0`; sweet-telephonyd publishes the service to configd). IPv4 only: Sunrise has no IPv6 (the kernel's IPv6 path is there for carriers that do); calls and SMS are not planned | ⚠️ |
+| 📶 Cellular Data | Snapdragon X55 brought up by the kernel (`sweetmdm=10 sweetmdmonline=1`): SIM, LTE registration on Sunrise, a new network search after 3 min without service; status bar shows **Sunrise, signal bars and LTE**; **mobile data works** (Safari over LTE with Wi-Fi off) through the kernel's `pdp_ip0` and `sweet-telephonyd` (the CommCenter stand-in, publishes the service to configd); the session survives a short loss of signal; **Control Center's cellular data button works**. IPv4 only (Sunrise has no IPv6). Not done: Settings > Cellular is incomplete (PIN, SIM lock, carrier settings, data usage, manual network selection); the switch stopping data in the kernel (0280) is untested; calls and SMS not planned | ✅ |
 | 📍 Location | Works through Wi-Fi positioning (Weather shows the city, Maps asks for permission) | ✅ |
 | 🛰️ GPS | No GPS receiver driver yet; location comes from Wi-Fi | ❌ |
 | 🪵 USB | Device mode (USB Ethernet + kernel log) for development; no host / iTunes | ⚠️ |
@@ -107,7 +107,7 @@
 |---|---|---|
 | 🧩 SMP | 4× A55, 3× A77, 1× A77 prime via PSCI | ✅ |
 | 📈 Frequency scaling | EPSS governor (kernel 0238): load-following per cluster, thermal cap at 75 °C, touch boost; idle at 288 / 710 / 844 MHz | ✅ |
-| 🔥 Idle CPU load | Home screen idle 7-9 % of one core once settled (kernel 0259; 0238: 65-120 %). CommCenter no longer crash-loops (stubs 0258 / 0259), but iOS now shows "Cellular issue detected"; the TTS synthesizers still crash in the first minutes | ✅ |
+| 🔥 Idle CPU load | Home screen idle 7-9 % of one core once settled (kernel 0259; 0238: 65-120 %). CommCenter replaced by sweet-telephonyd (no crash loop, no "Cellular issue detected"); the TTS synthesizers still crash in the first minutes | ✅ |
 | 🎯 Thread placement | UI / render threads (priority ≥ 46 and realtime) kept on the A77s (kernel 0248, `sweetbig`): backboardd + SpringBoard 93 % on big cores, starts on a slow core with a big one idle 245 → 26 per 10 s | ✅ |
 
 ## 🌄 Future Development
@@ -125,14 +125,7 @@
   * A boot with kernel 0237 alone (Bluetooth 1 s after UFS by default, no `sweetbtdelay=1` on the line)
   * BLE devices (watch, tracker, keyboard) and a second device paired at the same time
 * **CPU frequency scaling, next steps**: memory bus (DDR) voting with the load (apollo's 0153 `sweet_rpmh_ddr_set`); a CPU budget for runaway background processes (apollo's 0160); an idle-temperature comparison against the bootloader's clocks (`sweetcpufreq=0`)
-* **Cellular**: the Mi 10's modem is an external Snapdragon X55 on PCIe2, brought up entirely by the kernel
-  (`sweet_mdm.c`, kernels 0260-0272): power and PCIe2 link, sbl1 over BHI, the other 12 images over MHI / Sahara,
-  mission mode, QRTR, its TFTP and remote-EFS services (nothing written to the phone), operating mode steered by the
-  host, SIM provisioning session: **SIM READY and REGISTERED on LTE (-90 dBm)**, kept up as a kernel service with its
-  state in `kern.sweet_cell` (kernel 0273). iOS gets it through `sweet-telephonyd`, a stand-in for CommCenter that
-  answers CoreTelephony from the modem's state (SIM, operator, signal, LTE) and notifies SpringBoard. Status bar: carrier + bars (MobileGestalt
-  cache rebuilt once with a `baseband` node). Next: Settings > Cellular, mobile data (WDS, IP_HW0 100/101). Calls are not planned (data-only
-  SIM; calls need VoLTE)
+* **Cellular**: Settings > Cellular (answers for PIN attempts, SIM lock, carrier bundle values, data usage; manual network selection = NAS network scan + selection); boot and test the switch kernel 0280 (`umi-0280-data-switch.img`) and the reconnect after a dropped session (0279c); the USB Ethernet gadget that stops mid-boot and never recovers; the `baseband` ADT node (opt-in, `mkadt.py --baseband`) once the GPU's 2-frame loop is understood. Calls / SMS not planned (data-only SIM; calls need VoLTE)
 * **CPU load**: the TTS synthesizers' crashes in the first minutes (KonaSynthesizer / SiriTTSSynthesizerAU / MacinTalkAUSP)
 * **fairplayd**: `fairplayd.H2` is out of launchd's job list (that unblocked location on 2026-10-31); still to do:
   put `CoreLocationMigrator` back, check `fairplaydeviceidentityd`, and make it part of the image build
@@ -144,4 +137,4 @@
 * **Charging**: why a 3 A USB-PD charger only gives ~+0.6 A (AICL?); QC 3.0 test with a QC charger; USB-PD and the SMB1390 charge pump for 30 W
 * **Audio**: check that the speaker still plays with the plug-in's hardware volume control removed (installed, not yet loaded)
 * **Wi-Fi**: 5 GHz, HT / VHT rates, WPA3
-* **Cellular**, **GPS**, **Fingerprint**, **Face ID / SEP**, **NFC**, **Wireless charging**
+* **GPS**, **Fingerprint**, **Face ID / SEP**, **NFC**, **Wireless charging**
