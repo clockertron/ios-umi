@@ -52,6 +52,18 @@
   - **Seen, not looked into:** at rest backboardd alone submits and presents at exactly 10 Hz, for ever (SpringBoard
     0 submits) - something stays dirty; the bandwidth table sent to the GMU has one "off" level (no DDR vote for the
     GPU); phone at 70 C / GPU 67.5 C, CPUs capped.
+  - **App Library blur, one more thing ruled out (23:05, 0282b):** `/var/local/mtl2-tu-debug` =
+    `noubwc,unaligned_store,3d_load,nobin` for one boot (user OK'd; active in every Metal process per mtl2.log):
+    user "it was already like that before but the UI was not flickering like crazy" - the backdrop is still not
+    blurred and does not fill the screen, and these flags add heavy flicker. So Turnip's tile load (2D blit vs 3D),
+    its aligned tile store and binning are not the cause. File put back to `noubwc` (read back; the copy
+    `mtl2-tu-debug.sweet-pre-blur` stays on the phone, harmless). Checked by reading: our local Turnip changes touch
+    no rendering path (builtin shader pack is compiled in only with a pack header; host import; scissor size 0);
+    the bridge reads the pass through input attachments in rasterization order (one subpass, colour i = input i),
+    which Turnip serves from GMEM (`patch_input_gmem`) with FLUSH_PER_OVERLAP; ios-apollo has no fix for this.
+    Next: a bridge build that logs only the backdrop passes (attachment sizes, renderTargetWidth/Height, viewport,
+    scissor, load/store, which draws fetch) - the user's "not blurred, not filling the screen" says the composite
+    shows a pooled texture unstretched, i.e. a size / sub-rectangle mismatch between the blur chain and the composite.
   - **Opt-in, untested:** `sweetgpuhwcg=1` programs Linux's a650_hwcg clock gating in step 20 (the SP clock off
     around it, RBBM_CLOCK_CNTL 0x8aa8aa82; the three GMU CGC registers are left alone).
 - **2026-11-11 21:25: Control Center's cellular data button works; the Cellular Data switch** (sweet-telephonyd this
