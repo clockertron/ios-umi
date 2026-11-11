@@ -1,0 +1,51 @@
+From 978d222e405c7539af6e914e0c38076bad3ec7db Mon Sep 17 00:00:00 2001
+From: qualcomm-toolbox <169756160+qcom-toolbox@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 21:24:54 +0100
+Subject: [PATCH] umi: X55 (0280): kern.sweet_cell_data_on - the Cellular Data
+ switch stops (WDS Stop Network) / restarts the data session (untested)
+
+---
+ bsd/dev/sweet_mdm.c | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/bsd/dev/sweet_mdm.c b/bsd/dev/sweet_mdm.c
+index 062201d..637c4b5 100644
+--- a/bsd/dev/sweet_mdm.c
++++ b/bsd/dev/sweet_mdm.c
+@@ -2348,6 +2348,10 @@ static struct {
+ } mdd;
+ 
+ static char sweet_cell_data[512] = "data=off";
++/* 0280: the user's Cellular Data switch (Settings / Control Center, through sweet-telephonyd): 0 stops the session */
++static int sweet_cell_data_on = 1;
++SYSCTL_INT(_kern, OID_AUTO, sweet_cell_data_on, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_cell_data_on, 0,
++    "sweet: mobile data wanted (the Cellular Data switch)");
+ SYSCTL_STRING(_kern, OID_AUTO, sweet_cell_data, CTLFLAG_RD | CTLFLAG_LOCKED, sweet_cell_data, sizeof(sweet_cell_data),
+     "sweet: the modem's mobile data session (sweetmdm=10)");
+ 
+@@ -2450,6 +2454,22 @@ mx_data_step(unsigned t_ms)
+ {
+ 	unsigned on = md.stage >= 10;   /* sweetmdm=10: the service (9) with mobile data (boot-args are short of room) */
+ 	(void)PE_parse_boot_argn("sweetmdmdata", &on, sizeof(on));
++	/* the switch off: the running session stopped (WDS Stop Network 0x21 with its handle), nothing started */
++	if (!sweet_cell_data_on) {
++		if (mdd.up) {
++			uint8_t st[8];
++			unsigned sk = 0;
++			mx_put32(st, &sk, 0x01, mdd.handle);
++			printf("SWEET MDM: DATA: the Cellular Data switch is off: stop network (handle %#x)\n", mdd.handle);
++			mx_qmi_req(0x01, 0x21, st, (uint16_t)sk);
++			mdd.up = false;
++			mdd.addr = 0;
++			mdd.step = 6;
++			mdd.at = 0;
++			snprintf(sweet_cell_data, sizeof(sweet_cell_data), "data=off switch=off");
++		}
++		return;
++	}
+ 	if (!on || mq.reg != 1 || mq.svc_port[0x01] == 0 || mq.svc_port[0x1a] == 0 || (mdd.step & 1) || mdd.up ||
+ 	    t_ms < mdd.at) {
+ 		return;
+-- 
+2.54.0 (Apple Git-157)
+

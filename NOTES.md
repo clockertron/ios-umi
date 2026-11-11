@@ -2,6 +2,19 @@
 
 ## umi (Xiaomi Mi 10, SM8250) port - branch `umi` on qcom-toolbox/ios-sweet (2026-10-20)
 
+- **2026-11-11 21:25: Control Center's cellular data button works; the Cellular Data switch** (sweet-telephonyd this
+  commit; patch `xnu/patches/0281-umi-x55-data-switch.patch`, kernel 0280, image `shim/out/umi-0280-data-switch.img`).
+  - Settings / SpringBoard ask the legacy plain-XPC API: kPacketGetProperty `kEnableCellularData` (the user switch),
+    `kCellularDataEnabled`, `kCellularDataCapable`, `kAirplaneMode`; kRadioModuleGetProperty `kRadioModuleIsDead`
+    (SpringBoard ~1/s), `kRadioModuleFirmwareVersion`. The echo answered **false** -> "Cellular Data off", Control
+    Center's button grayed. Now answered from the real state (switch, registered); **Control Center: good** (user).
+  - The switch: kPacketSetProperty kEnableCellularData -> kept in `/private/var/sweet/cellular-data` (phone file, ours)
+    and written to the new **kern.sweet_cell_data_on** (RW); kernel 0280: off = WDS Stop Network 0x21 (handle),
+    pdp_ip0 down, "data=off switch=off"; on = Start Network again. Kernel side not booted / tested yet.
+  - Settings > Cellular is still incomplete (user; left for now). Its CT calls: copyCarrierBundleValue* (no carrier
+    bundle), getRemainingPINAttemptCount, fetchSIMLockValue, getNRDisableStatus, copyLocalizedOperatorName,
+    privacyProxy, isNetworkSelectionMenuAvailable (manual network selection needs a NAS network scan + selection),
+    getSIMToolkitMenuForContext, isHighDataModeSupported, dataUsageForLastPeriods.
 - **2026-11-11 21:15: signal lost and back with data intact; reconnect handling for a dropped session (untested)**
   (patch `xnu/patches/0280-umi-x55-data-reconnect.patch`, kernel 0279c; image `shim/out/umi-0279c-reconnect.img`).
   - On 0279b in the countryside: registered (-86 dBm) -> "searching", then no radio at all (-128 dBm, rat none) for a

@@ -579,9 +579,48 @@ xpc_short(xpc_object_t o)
 
 /* typed answers for the old _CTServerConnection property getters (kPacketGetProperty, kRegistrationGetProperty);
  * types from CoreTelephony's readers (bool: dyn_cast_or_default(obj, bool), string: copied to a CFString) */
+/*
+ * The Cellular Data switch (Settings, Control Center): kPacketGetProperty kEnableCellularData / kCellularDataEnabled /
+ * kCellularDataCapable, set with kPacketSetProperty kEnableCellularData. The state is kept in
+ * /private/var/sweet/cellular-data (a "0" turns it off) and given to the kernel as kern.sweet_cell_data_on, which
+ * stops / starts the modem's data session.
+ */
+static BOOL
+data_switch(void)
+{
+	NSString *v = [NSString stringWithContentsOfFile:@"/private/var/sweet/cellular-data" encoding:NSUTF8StringEncoding
+	                                           error:NULL];
+	return ![v hasPrefix:@"0"];
+}
+
+static void
+data_switch_set(BOOL on)
+{
+	[(on ? @"1\n" : @"0\n") writeToFile:@"/private/var/sweet/cellular-data" atomically:YES encoding:NSUTF8StringEncoding
+	                              error:NULL];
+	int v = on ? 1 : 0;
+	int e = sysctlbyname("kern.sweet_cell_data_on", NULL, NULL, &v, sizeof(v));
+	say(@"data: Cellular Data switch %@ (kernel: %@)", on ? @"ON" : @"OFF", e == 0 ? @"ok" : @"FAILED");
+}
+
 static xpc_object_t
 plain_property(const char *key)
 {
+	if (strcmp(key, "kEnableCellularData") == 0 || strcmp(key, "kCellularDataEnabled") == 0) {
+		return xpc_bool_create(data_switch());
+	}
+	if (strcmp(key, "kCellularDataCapable") == 0) {
+		return xpc_bool_create(registered());
+	}
+	if (strcmp(key, "kAirplaneMode") == 0) {
+		return xpc_bool_create(false);
+	}
+	if (strcmp(key, "kRadioModuleIsDead") == 0) {
+		return xpc_int64_create(0);
+	}
+	if (strcmp(key, "kRadioModuleFirmwareVersion") == 0) {
+		return xpc_string_create("SDX55");
+	}
 	if (strcmp(key, "kCellularDataHideRatIndicator") == 0 || strcmp(key, "kCellularDataHideIndicator") == 0 ||
 	    strcmp(key, "kRegistrationEmergencyCallBackMode") == 0) {
 		return xpc_bool_create(false);
@@ -718,6 +757,10 @@ plain_listen(const char *service)
 			if (logged++ < 3000) {
 				say(@"XPC %@ %@ %@: %@", svc, who, r, xpc_short(msg));
 			}
+			if (req != NULL && strcmp(req, "kPacketSetProperty") == 0 &&
+			    xpc_dictionary_get_value(msg, "kEnableCellularData") != NULL) {
+				data_switch_set(xpc_dictionary_get_bool(msg, "kEnableCellularData"));
+			}
 			xpc_object_t reply = xpc_dictionary_create_reply(msg);
 			if (reply != NULL) {
 				/* echo: the request's keys and placeholder values back; property keys with a known type get a real
@@ -748,6 +791,7 @@ main(void)
 		log_ring = [NSMutableArray array];
 		counts = [NSMutableDictionary dictionary];
 		say(@"sweet-telephonyd start; modem: %@", cell_state());
+		data_switch_set(data_switch());         /* the kernel follows the stored switch after a reboot */
 		p_create_mach_service = dlsym(RTLD_DEFAULT, "xpc_connection_create_mach_service");
 		p_get_pid = dlsym(RTLD_DEFAULT, "xpc_connection_get_pid");
 		if (p_create_mach_service == NULL || p_get_pid == NULL) {
